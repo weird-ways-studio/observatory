@@ -11,9 +11,10 @@ At 11:00 UTC (`triggers` in `wrangler.jsonc`), `src/copy.ts` runs:
 1. Lists that night's backup objects in the main backup bucket, with a read-only key scoped to that one bucket. The objects are encrypted before upload, so the Observatory cannot read them.
 2. Copies each one into this account's own bucket. R2 refuses a copy whose bytes do not hash to the source's MD5, and the Worker checks the result again. A source object without a plain MD5 fails the night rather than go unchecked.
 3. Tries to delete a permanently locked canary object. If it is ever gone, the lock is not working and the night fails.
-4. Pings the dead-man check "up" only if every step passed; otherwise it reports a failure, so Ben gets an email. A missed night also emails him.
+4. Reads this account's own lock rules for the copy bucket (`src/lock.ts`, design 3f), because a refused delete proves a lock exists but not how long it holds. The night fails if no enabled rule covers all of `daily/` for 30 days, or any enabled rule there holds less, or the rules cannot be read or understood. Until its read-only key (`LOCK_READ_TOKEN`, `LOCK_ACCOUNT_ID`) is set at cutover, the night logs `lockLength: "not set up"` and claims nothing about it.
+5. Pings the dead-man check "up" only if every step passed; otherwise it reports a failure, so Ben gets an email. A missed night also emails him.
 
-The copy bucket's lock rules keep each night for 3 days (the canary forever); a lifecycle rule then removes it. Lock rules win over lifecycle rules, and the Worker's own code cannot delete a locked object. One log line per night records counts, bytes, total stored bytes and the canary result.
+The copy bucket's lock rules keep each night for 30 days (D2, Ben 2026-10-31; the canary forever); a lifecycle rule then removes it. Lock rules win over lifecycle rules, and the Worker's own code cannot delete a locked object. One log line per night records counts, bytes, total stored bytes, the canary result and the lock-length verdict.
 
 ## Hourly freshness check (card f0d4e2fc)
 
@@ -30,6 +31,7 @@ Limit: it runs inside the thing it checks. That counts only after cutover, when 
 ## How it is protected
 
 - **Who can change it:** `main` takes only pull requests with Ben's approval of the latest push (ruleset `protect-main`, the same as front-desk's): no bypass, no force push, no deletion.
+- **Its own home (cutover by 2026-11-13, card 3e2f8870):** this repo moves to its own GitHub org, `weird-ways-observatory`, owned by `benculbert` and `weird-ways`, which refuses all personal access tokens, so no agent credential can reach it. Agents then propose changes from a fork, `weird-ways-studio/observatory-proposals`, and send Ben a compare link (see `CLAUDE.md`).
 - **What deploys:** Cloudflare **Workers Builds** in the Observatory's own Cloudflare account builds `main` and deploys it; its trigger includes only `main`, because a branch build would run code nobody reviewed with the build's deploy rights. **Known gap (2026-10-31):** a merge does not yet start a build by itself -- every build so far was started by hand (dashboard retry or the Builds API), always from `main`. Root-cause card c19f4946.
 - **Who holds keys:** no agent holds any Observatory credential, except two temporary keys Ben approved for phase 2c setup (one for R2 and Workers scripts, one for reading and starting builds), both expiring 2026-11-13. Agents change the code only by opening pull requests.
 - **Address (studio app-exposure doors):** none. `wrangler.jsonc` turns off workers.dev and preview URLs and has no routes, so the Worker is unreachable from any network, which is stricter than the tailnet-only door. Endpoints added in later phases go behind an edge login (door 2). `test/config.test.ts` fails if the address, bindings or schedules change.
@@ -38,7 +40,7 @@ Limit: it runs inside the thing it checks. That counts only after cutover, when 
 ## Known limits
 
 - Until the studio's temporary access ends on 2026-11-13 (revocation plan, epic cafd3acc), agents hold keys that can edit org rulesets, the main backup bucket's settings, and this account. So neither this protection nor the backup copy is independent of the agents yet; independence is claimed only after those keys are proven refused.
-- The copy faithfully copies whatever the source holds. If tonight's source were overwritten with garbage, earlier nights stay locked here for 3 days; spotting the tampering is a later phase.
+- The copy faithfully copies whatever the source holds. If tonight's source were overwritten with garbage, earlier nights stay locked here for 30 days; spotting the tampering is a later phase.
 - Cloudflare's own GitHub app (Workers and Pages) holds administration write on the repos it is installed on. Cloudflare controls it; no studio agent can drive it.
 
 ## Develop

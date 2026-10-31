@@ -34,7 +34,7 @@ class FakeBucket {
 }
 
 type Obj = { key: string; data: string; etag?: string };
-function night(objects: Obj[], opts: { pageSize?: number; status?: number; pushover?: boolean; throwWith?: string } = {}) {
+function night(objects: Obj[], opts: { pageSize?: number; status?: number; pushover?: boolean; throwWith?: string; lockSeconds?: number } = {}) {
   const bucket = new FakeBucket();
   const pings: string[] = [];
   const alerts: string[] = [];
@@ -48,6 +48,10 @@ function night(objects: Obj[], opts: { pageSize?: number; status?: number; pusho
     if (url.hostname === "api.pushover.net") {
       alerts.push(new URLSearchParams(await req.text()).get("message") ?? "");
       return new Response('{"status":1}');
+    }
+    if (url.hostname === "api.cloudflare.com") {
+      const rules = [{ enabled: true, prefix: "daily/", condition: { type: "Age", maxAgeSeconds: opts.lockSeconds } }];
+      return Response.json({ success: true, result: { rules } });
     }
     if (opts.throwWith) throw new Error(opts.throwWith);
     assert.match(req.headers.get("authorization") ?? "", /^AWS4-HMAC-SHA256 /); // every source call is signed
@@ -68,6 +72,7 @@ function night(objects: Obj[], opts: { pageSize?: number; status?: number; pusho
     SOURCE_ACCESS_KEY_ID: "AKID", SOURCE_SECRET_ACCESS_KEY: "secret",
     SOURCE_ENDPOINT: "https://source.example", SOURCE_BUCKET: "src-bucket", PING_URL: "https://hc.example/check",
     ...(opts.pushover ? { PUSHOVER_TOKEN: "t".repeat(30), PUSHOVER_USER: "u".repeat(30) } : {}),
+    ...(opts.lockSeconds !== undefined ? { LOCK_READ_TOKEN: "lock-token", LOCK_ACCOUNT_ID: "acct" } : {}),
   } satisfies Env;
   const run = () => runNight(env, { fetch, sized: (body) => body }, NOW);
   return { bucket, pings, alerts, run };
@@ -158,6 +163,24 @@ test("if the locked canary can be deleted, the night fails", async () => {
   assert.equal(report.canary, "DELETED");
   assert.equal(report.canaryDelete, "resolved");
   assert.equal(n.bucket.store.has(CANARY_KEY), false);
+  assert.deepEqual(n.pings, ["/check/fail"]);
+});
+
+test("before the lock-read key exists, the night claims nothing about lock length and still pings up", async () => {
+  const report = await night(tonight).run();
+  assert.equal(report.lockLength, "not set up");
+  assert.equal(report.ok, true, report.failures.join("; "));
+});
+
+test("with the lock-read key: 30 days passes; a shortened lock fails the night and alerts", async () => {
+  const good = await night(tonight, { lockSeconds: 30 * 86_400 }).run();
+  assert.equal(good.lockLength, "ok");
+  assert.equal(good.ok, true, good.failures.join("; "));
+  const n = night(tonight, { lockSeconds: 3 * 86_400, pushover: true });
+  const report = await n.run();
+  assert.equal(report.lockLength, "short");
+  assert.match(report.failures.join(), /holds 3 days, under 30 days/);
+  assert.equal(n.alerts.length, 1);
   assert.deepEqual(n.pings, ["/check/fail"]);
 });
 

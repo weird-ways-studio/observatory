@@ -3,8 +3,9 @@
 // The Observatory never sees backup contents: the objects are age-encrypted before upload.
 import { AwsClient } from "aws4fetch";
 import { alert, redact, type AlertEnv } from "./alert.ts";
+import { readLockLength, type LockEnv } from "./lock.ts";
 
-export interface Env extends AlertEnv {
+export interface Env extends AlertEnv, LockEnv {
   COPY: R2Bucket;
   SOURCE_ACCESS_KEY_ID: string; // read-only key, scoped to the source bucket
   SOURCE_SECRET_ACCESS_KEY: string;
@@ -129,6 +130,10 @@ export async function runNight(env: Env, deps: Deps, now: Date) {
     failures.push(`canary check failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  // A refused delete proves a lock exists, not how long it holds (src/lock.ts).
+  const lock = await readLockLength(env, deps.fetch, now);
+  if ("reason" in lock) failures.push(`lock length ${lock.verdict}: ${lock.reason}`);
+
   let storedBytes = 0, cursor: string | undefined;
   do {
     const page = await env.COPY.list({ cursor });
@@ -137,7 +142,7 @@ export async function runNight(env: Env, deps: Deps, now: Date) {
   } while (cursor);
 
   // Error text can quote a URL or key; nothing secret goes on to the log, the phone or healthchecks.
-  const report = { date, ok: failures.length === 0, objects: night.length, copied, skipped, bytes, storedBytes, canary, canaryDelete: redact(canaryDelete, env), failures: failures.map((f) => redact(f, env)) };
+  const report = { date, ok: failures.length === 0, objects: night.length, copied, skipped, bytes, storedBytes, canary, canaryDelete: redact(canaryDelete, env), lockLength: lock.verdict, failures: failures.map((f) => redact(f, env)) };
   console.log(JSON.stringify(report));
   // Only a fully verified night pings "up". A failed night sends one alert (phone, else healthchecks
   // /fail), and healthchecks hears /fail either way so the dead-man check stays true.
