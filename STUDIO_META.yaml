@@ -3,8 +3,8 @@ phase: Prototype
 phase_since: 2026-10-30
 mode: low-maintenance   # Ben, 2026-10-30 (card 24b9395b)
 description: |
-  Independent recorder and auditor of agent actions (epic cafd3acc). Phase 1:
-  protected home only -- an empty Worker deployed from Ben-approved main.
+  Independent recorder and auditor of agent actions (epic cafd3acc). Phase 2c:
+  nightly locked copy of the studio backups, deployed from Ben-approved main.
 language: typescript
 deploy: Cloudflare Workers Builds from main (its own Cloudflare account)
 staging_environment: none
