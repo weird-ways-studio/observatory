@@ -45,6 +45,7 @@ export async function readMain(fetchFn: (req: Request) => Promise<Response>): Pr
   }
 }
 
+/** Whole hours from `iso` to `now`, as "3h". */
 const since = (iso: string, now: Date) => `${Math.floor((now.getTime() - Date.parse(iso)) / HOUR)}h`;
 
 /** The verdict for this hour and the state to keep. Only a matching read is ever healthy. */
@@ -68,6 +69,7 @@ export function judge(prev: State, deployed: string | undefined, main: Main, now
   return { verdict: over ? "not-live" : "waiting", state, reason: `main is ${main.sha.slice(0, 7)}, live is ${deployed.slice(0, 7)}, for ${since(state.mismatchSince, now)}` };
 }
 
+/** The verdicts that alert and send /fail. */
 const isBad = (v: Verdict): v is "not-live" | "unverified" => v === "not-live" || v === "unverified";
 const TITLES = { "not-live": "Observatory: a merge did not go live", unverified: "Observatory: cannot verify what is live" } as const;
 
