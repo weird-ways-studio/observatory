@@ -1,0 +1,1 @@
+Ben 2026-10-30 (decision 0cd48379, "Option 1"): repo is PUBLIC on purpose; code reaches GitHub only via Ben-reviewed PRs, never auto-push.
