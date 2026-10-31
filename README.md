@@ -17,7 +17,7 @@ The copy bucket's lock rules keep each night for 3 days (the canary forever); a 
 
 ## Hourly freshness check (card f0d4e2fc)
 
-At :30 past every hour, `src/fresh.ts` (and only it: `src/index.ts` routes each cron by name) reads `main`'s head commit from GitHub's public API, without a credential, and compares it with `DEPLOYED_SHA`, which the deploy command records for each deploy.
+At :30 past every hour, `src/fresh.ts` (and only it: `src/index.ts` routes each cron by name) reads `main`'s head commit from GitHub's public API by the repo's numeric id (it survives the move to a new org), without a credential, and compares it with `DEPLOYED_SHA`, which the deploy command records for each deploy.
 
 - `main` ahead of what is live for 6 hours: one alert ("a merge did not go live").
 - GitHub unreadable for 3 hours (including its 60-an-hour limit on reads without a key), or no `DEPLOYED_SHA`, or its own state unreadable: one alert ("cannot verify what is live"). Never "healthy".

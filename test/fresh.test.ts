@@ -58,7 +58,7 @@ test("readMain asks the public API for main's sha, with a User-Agent and no cred
   let seen: Request | undefined;
   const main = await readMain(async (req) => ((seen = req), new Response(`${LIVE}\n`)));
   assert.deepEqual(main, { sha: LIVE });
-  assert.equal(seen!.url, "https://api.github.com/repos/weird-ways-studio/observatory/commits/main");
+  assert.equal(seen!.url, "https://api.github.com/repositories/1440498313/commits/main");
   assert.equal(seen!.headers.get("Accept"), "application/vnd.github.sha");
   assert.ok(seen!.headers.get("User-Agent"));
   assert.equal(seen!.headers.get("Authorization"), null);
