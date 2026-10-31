@@ -18,15 +18,23 @@ test("no public address: workers.dev and preview URLs off, no routes", () => {
   for (const key of ["route", "routes"]) assert.equal(config[key], undefined, key);
 });
 
-test("phase 1 reaches nothing: only the reviewed keys, so no bindings, vars, crons or build step", () => {
+test("only the reviewed keys: no vars, no build step, nothing beyond phase 2c", () => {
   assert.deepEqual(Object.keys(config).sort(), [
     "compatibility_date",
     "main",
     "name",
+    "observability",
     "preview_urls",
+    "r2_buckets",
     "send_metrics",
+    "triggers",
     "workers_dev",
   ]);
+});
+
+test("phase 2c reaches only its own copy bucket, once a night", () => {
+  assert.deepEqual(config.r2_buckets, [{ binding: "COPY", bucket_name: "observatory-backups" }]);
+  assert.deepEqual(config.triggers, { crons: ["0 11 * * *"] });
 });
 
 test("anything that does reach it gets 404", async () => {

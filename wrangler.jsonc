@@ -1,6 +1,9 @@
 // Cloudflare Workers config. Workers Builds deploys main only (Ben-reviewed).
-// Phase 1 (card 24b9395b): an empty Worker with no address at all -- no workers.dev,
-// no preview URLs, no routes -- and no bindings, so it can reach nothing and nothing reaches it.
+// No address at all -- no workers.dev, no preview URLs, no routes -- so nothing reaches it.
+// Phase 2c (card 202ac367): a nightly cron and one binding, the locked copy bucket.
+// 11:00 UTC is after the c-box backup (03:10 CT) and push (04:32 CT) in both CDT and CST.
+// Secrets (set in the dashboard, never here): SOURCE_ACCESS_KEY_ID, SOURCE_SECRET_ACCESS_KEY,
+// SOURCE_ENDPOINT, SOURCE_BUCKET, PING_URL. Wrangler deploys never delete them.
 // test/config.test.ts fails if any of that changes; widen it only in a reviewed PR.
 // Comments here stay on their own lines: the test reads this file as JSON after dropping them.
 {
@@ -9,5 +12,8 @@
   "compatibility_date": "2026-10-01",
   "workers_dev": false,
   "preview_urls": false,
-  "send_metrics": false
+  "send_metrics": false,
+  "triggers": { "crons": ["0 11 * * *"] },
+  "r2_buckets": [{ "binding": "COPY", "bucket_name": "observatory-backups" }],
+  "observability": { "enabled": true }
 }
