@@ -3,6 +3,7 @@
 // `fetch` only if an address is ever added by mistake -- it has none.
 import { runNight, type Env } from "./copy.ts";
 
+/** Wraps a body of known size so R2 accepts it as a stream (R2 needs the length up front). */
 function sized(body: ReadableStream, size: number): ReadableStream {
   const { readable, writable } = new FixedLengthStream(size);
   body.pipeTo(writable).catch(() => undefined); // a broken pipe surfaces as the put's error

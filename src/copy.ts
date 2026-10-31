@@ -30,6 +30,7 @@ export const CANARY_KEY = "canary/do-not-delete";
 // The c-box names each night's folder by its own local date (backup_engine.py).
 const BACKUP_TIME_ZONE = "America/Chicago";
 
+/** The YYYY-MM-DD folder name the c-box gives the backup made on the night of `now`. */
 export function backupDate(now: Date): string {
   // en-CA formats as YYYY-MM-DD.
   return new Intl.DateTimeFormat("en-CA", {
@@ -40,6 +41,7 @@ export function backupDate(now: Date): string {
 const unescapeXml = (s: string) =>
   s.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 
+/** One page of an S3 ListObjectsV2 reply: its objects, and the token for the next page if any. */
 export function parseListing(xml: string): { objects: Listed[]; next?: string } {
   const objects: Listed[] = [];
   for (const [, body] of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
@@ -59,8 +61,10 @@ export function md5FromEtag(etag: string): string {
   return md5;
 }
 
+/** An R2 checksum as lowercase hex ("" when R2 has none), comparable with an ETag MD5. */
 const hex = (buf: ArrayBuffer | undefined) => (buf ? [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("") : "");
 
+/** One night's run: copy and verify, check the canary, log one line, then ping up or /fail. */
 export async function runNight(env: Env, deps: Deps, now: Date) {
   const date = backupDate(now);
   const failures: string[] = [];
