@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import worker from "../src/index.ts";
+import worker, { NIGHT_CRON } from "../src/index.ts";
+import { FRESH_CRON } from "../src/fresh.ts";
 
 // wrangler.jsonc keeps its comments on their own lines, so dropping those lines leaves JSON.
 const config = JSON.parse(
@@ -32,9 +33,10 @@ test("only the reviewed keys: no vars, no build step, nothing beyond phase 2c", 
   ]);
 });
 
-test("phase 2c reaches only its own copy bucket, once a night", () => {
+test("it reaches only its own copy bucket: once a night for backups, hourly for freshness", () => {
   assert.deepEqual(config.r2_buckets, [{ binding: "COPY", bucket_name: "observatory-backups" }]);
-  assert.deepEqual(config.triggers, { crons: ["0 11 * * *"] });
+  assert.deepEqual(config.triggers, { crons: [NIGHT_CRON, FRESH_CRON] });
+  assert.deepEqual([NIGHT_CRON, FRESH_CRON], ["0 11 * * *", "30 * * * *"]);
 });
 
 test("anything that does reach it gets 404", async () => {
