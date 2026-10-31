@@ -1,0 +1,13 @@
+// Cloudflare Workers config. Workers Builds deploys main only (Ben-reviewed).
+// Phase 1 (card 24b9395b): an empty Worker with no address at all -- no workers.dev,
+// no preview URLs, no routes -- and no bindings, so it can reach nothing and nothing reaches it.
+// test/config.test.ts fails if any of that changes; widen it only in a reviewed PR.
+// Comments here stay on their own lines: the test reads this file as JSON after dropping them.
+{
+  "name": "observatory",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "send_metrics": false
+}

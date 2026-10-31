@@ -1,0 +1,16 @@
+{
+  "name": "observatory",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test 'test/*.test.ts'",
+    "typecheck": "tsc",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261026.1",
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2",
+    "wrangler": "4.152.0"
+  }
+}

@@ -1,0 +1,24 @@
+name: observatory
+phase: Prototype
+phase_since: 2026-10-30
+mode: low-maintenance   # Ben, 2026-10-30 (card 24b9395b)
+description: |
+  Independent recorder and auditor of agent actions (epic cafd3acc). Phase 1:
+  protected home only -- an empty Worker deployed from Ben-approved main.
+language: typescript
+deploy: Cloudflare Workers Builds from main (its own Cloudflare account)
+staging_environment: none
+canonical_test_command: npm test
+canonical_sources:
+  version: none   # phase 1 has no version endpoint
+  coverage: not measured
+  health: none   # no address at all in phase 1, by design
+infrastructure:
+  ci_workflow: none
+  pre_commit_hook: true   # studio-os hooks/observatory-pre-commit.sh (deny list + secret scan)
+  pre_push_hook: false
+  post_merge_hook: false
+  coverage_floor: null
+  specs_doc: ~/studio/studio-os/docs/specifications/trust-but-verify/PLAN.md
+known_gaps:
+  - Not independent of agents until the temporary org-admin key is revoked and proven refused (card 24b9395b, threat T2).
