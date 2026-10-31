@@ -10,8 +10,9 @@ export interface FreshEnv extends AlertEnv {
 }
 
 export const FRESH_CRON = "30 * * * *";
-// Public repo, read without a credential. After the move to its own org GitHub redirects this path.
-export const REPO = "weird-ways-studio/observatory";
+// Public repo, read without a credential, by its numeric id: the id survives the move to its own
+// org, so nothing relies on GitHub's redirect from the old name (design DESIGN-watch-home 3c).
+export const REPO_ID = 1440498313;
 export const STATE_KEY = "state/freshness.json"; // state/ has no lock
 const HOUR = 3_600_000;
 export const NOT_LIVE_AFTER = 6 * HOUR;
@@ -29,7 +30,7 @@ export type Main = { sha: string } | { error: string };
 
 /** main's head commit from the public GitHub API. Any failure, a rate limit included, is an error. */
 export async function readMain(fetchFn: (req: Request) => Promise<Response>): Promise<Main> {
-  const req = new Request(`https://api.github.com/repos/${REPO}/commits/main`, {
+  const req = new Request(`https://api.github.com/repositories/${REPO_ID}/commits/main`, {
     headers: { Accept: "application/vnd.github.sha", "User-Agent": "observatory-freshness" },
   });
   try {
