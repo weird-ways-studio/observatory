@@ -34,9 +34,10 @@ class FakeBucket {
 }
 
 type Obj = { key: string; data: string; etag?: string };
-function night(objects: Obj[], opts: { pageSize?: number; status?: number } = {}) {
+function night(objects: Obj[], opts: { pageSize?: number; status?: number; pushover?: boolean; throwWith?: string } = {}) {
   const bucket = new FakeBucket();
   const pings: string[] = [];
+  const alerts: string[] = [];
   const pageSize = opts.pageSize ?? 1000;
   const fetch = async (req: Request) => {
     const url = new URL(req.url);
@@ -44,6 +45,11 @@ function night(objects: Obj[], opts: { pageSize?: number; status?: number } = {}
       pings.push(url.pathname);
       return new Response("OK");
     }
+    if (url.hostname === "api.pushover.net") {
+      alerts.push(new URLSearchParams(await req.text()).get("message") ?? "");
+      return new Response('{"status":1}');
+    }
+    if (opts.throwWith) throw new Error(opts.throwWith);
     assert.match(req.headers.get("authorization") ?? "", /^AWS4-HMAC-SHA256 /); // every source call is signed
     if (opts.status) return new Response("denied", { status: opts.status });
     if (url.searchParams.get("list-type") === "2") {
@@ -61,9 +67,10 @@ function night(objects: Obj[], opts: { pageSize?: number; status?: number } = {}
     COPY: bucket as unknown as R2Bucket,
     SOURCE_ACCESS_KEY_ID: "AKID", SOURCE_SECRET_ACCESS_KEY: "secret",
     SOURCE_ENDPOINT: "https://source.example", SOURCE_BUCKET: "src-bucket", PING_URL: "https://hc.example/check",
+    ...(opts.pushover ? { PUSHOVER_TOKEN: "t".repeat(30), PUSHOVER_USER: "u".repeat(30) } : {}),
   } satisfies Env;
   const run = () => runNight(env, { fetch, sized: (body) => body }, NOW);
-  return { bucket, pings, run };
+  return { bucket, pings, alerts, run };
 }
 
 const tonight = [
@@ -150,4 +157,26 @@ test("if the locked canary can be deleted, the night fails", async () => {
   assert.equal(report.canary, "DELETED");
   assert.equal(n.bucket.store.has(CANARY_KEY), false);
   assert.deepEqual(n.pings, ["/check/fail"]);
+});
+
+test("with Pushover set up: a good night sends no alert and pings up", async () => {
+  const n = night(tonight, { pushover: true });
+  await n.run();
+  assert.deepEqual(n.alerts, []);
+  assert.deepEqual(n.pings, ["/check"]);
+});
+
+test("with Pushover set up: a failing night sends exactly one alert, and healthchecks still hears /fail", async () => {
+  const n = night([tonight[2]], { pushover: true });
+  await n.run();
+  assert.equal(n.alerts.length, 1);
+  assert.match(n.alerts[0], /no source objects for 2026-10-31/);
+  assert.deepEqual(n.pings, ["/check/fail"]);
+});
+
+test("a failure quoting the source endpoint or a key is redacted before the log, phone and healthchecks", async () => {
+  const n = night(tonight, { pushover: true, throwWith: "connect to https://source.example/src-bucket failed (AKID)" });
+  const report = await n.run();
+  const all = [JSON.stringify(report), ...n.alerts].join(" ");
+  for (const secret of ["source.example", "src-bucket", "AKID"]) assert.ok(!all.includes(secret), secret);
 });

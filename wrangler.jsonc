@@ -3,7 +3,8 @@
 // Phase 2c (card 202ac367): a nightly cron and one binding, the locked copy bucket.
 // 11:00 UTC is after the c-box backup (03:10 CT) and push (04:32 CT) in both CDT and CST.
 // Secrets (set in the dashboard, never here): SOURCE_ACCESS_KEY_ID, SOURCE_SECRET_ACCESS_KEY,
-// SOURCE_ENDPOINT, SOURCE_BUCKET, PING_URL. Wrangler deploys never delete them.
+// SOURCE_ENDPOINT, SOURCE_BUCKET, PING_URL, and for phase 2b alerts (card 9a6ed286)
+// PUSHOVER_TOKEN, PUSHOVER_USER. Wrangler deploys never delete them.
 // test/config.test.ts fails if any of that changes; widen it only in a reviewed PR.
 // Comments here stay on their own lines: the test reads this file as JSON after dropping them.
 {
