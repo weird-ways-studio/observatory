@@ -19,7 +19,7 @@ The copy bucket's lock rules keep each night for 3 days (the canary forever); a 
 
 - **Who can change it:** `main` takes only pull requests with Ben's approval of the latest push (ruleset `protect-main`, the same as front-desk's): no bypass, no force push, no deletion.
 - **What deploys:** Cloudflare **Workers Builds** in the Observatory's own Cloudflare account builds `main` and deploys it; its trigger includes only `main`, because a branch build would run code nobody reviewed with the build's deploy rights. **Known gap (2026-10-31):** a merge does not yet start a build by itself -- every build so far was started by hand (dashboard retry or the Builds API), always from `main`. Root-cause card c19f4946.
-- **Who holds keys:** no agent holds any Observatory credential, except one temporary key Ben approved for phase 2c setup, which expires 2026-11-13. Agents change the code only by opening pull requests.
+- **Who holds keys:** no agent holds any Observatory credential, except two temporary keys Ben approved for phase 2c setup (one for R2 and Workers scripts, one for reading and starting builds), both expiring 2026-11-13. Agents change the code only by opening pull requests.
 - **Address (studio app-exposure doors):** none. `wrangler.jsonc` turns off workers.dev and preview URLs and has no routes, so the Worker is unreachable from any network, which is stricter than the tailnet-only door. Endpoints added in later phases go behind an edge login (door 2). `test/config.test.ts` fails if the address, bindings or schedule change.
 - **Entry point:** `src/index.ts` (`main` in `wrangler.jsonc`); Cloudflare calls its default export's `scheduled` on the cron and `fetch` only if an address were ever added.
 
