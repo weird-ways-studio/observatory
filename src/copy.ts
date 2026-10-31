@@ -2,8 +2,9 @@
 // own locked bucket, verify every copy, and tell the dead-man check only when all of it worked.
 // The Observatory never sees backup contents: the objects are age-encrypted before upload.
 import { AwsClient } from "aws4fetch";
+import { alert, redact, type AlertEnv } from "./alert.ts";
 
-export interface Env {
+export interface Env extends AlertEnv {
   COPY: R2Bucket;
   SOURCE_ACCESS_KEY_ID: string; // read-only key, scoped to the source bucket
   SOURCE_SECRET_ACCESS_KEY: string;
@@ -131,9 +132,13 @@ export async function runNight(env: Env, deps: Deps, now: Date) {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
 
-  const report = { date, ok: failures.length === 0, objects: night.length, copied, skipped, bytes, storedBytes, canary, failures };
+  // Error text can quote a URL or key; nothing secret goes on to the log, the phone or healthchecks.
+  const report = { date, ok: failures.length === 0, objects: night.length, copied, skipped, bytes, storedBytes, canary, failures: failures.map((f) => redact(f, env)) };
   console.log(JSON.stringify(report));
-  // Only a fully verified night pings "up"; anything else reports a failure, so Ben gets the email.
-  await deps.fetch(new Request(report.ok ? env.PING_URL : `${env.PING_URL}/fail`, { method: "POST", body: JSON.stringify(report) }));
+  // Only a fully verified night pings "up". A failed night sends one alert (phone, else healthchecks
+  // /fail), and healthchecks hears /fail either way so the dead-man check stays true.
+  const via = report.ok ? undefined : await alert(env, deps.fetch, `Observatory: backup copy failed (${date})`,
+    `${report.failures.length} problem(s), ${copied} copied, ${skipped} already there, canary ${canary}.\n${report.failures.join("\n")}`);
+  if (via !== "healthchecks") await deps.fetch(new Request(report.ok ? env.PING_URL : `${env.PING_URL}/fail`, { method: "POST", body: JSON.stringify(report) }));
   return report;
 }
