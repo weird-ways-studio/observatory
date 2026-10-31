@@ -103,6 +103,7 @@ test("a good night copies only tonight's objects, verifies them, and pings up", 
   assert.equal(n.bucket.store.get(tonight[0].key), "brain bytes");
   assert.equal(n.bucket.store.has(tonight[2].key), false);
   assert.equal(report.canary, "refused");
+  assert.equal(report.canaryDelete, "threw Error: delete: object is locked");
   assert.deepEqual(n.pings, ["/check"]);
 });
 
@@ -155,6 +156,7 @@ test("if the locked canary can be deleted, the night fails", async () => {
   n.bucket.lockDeletes = false;
   const report = await n.run();
   assert.equal(report.canary, "DELETED");
+  assert.equal(report.canaryDelete, "resolved");
   assert.equal(n.bucket.store.has(CANARY_KEY), false);
   assert.deepEqual(n.pings, ["/check/fail"]);
 });

@@ -113,9 +113,13 @@ export async function runNight(env: Env, deps: Deps, now: Date) {
   }
 
   let canary = "refused";
+  // What the delete answered, word for word, so the lock-refusal check can be written to count
+  // only R2's real refusal (card f0d4e2fc; the docs do not say what the binding returns).
+  let canaryDelete = "not tried";
   try {
     if (!(await env.COPY.head(CANARY_KEY))) await env.COPY.put(CANARY_KEY, "locked forever; deleting it must fail");
-    await env.COPY.delete(CANARY_KEY).catch(() => undefined); // a refusal is the expected outcome
+    canaryDelete = await env.COPY.delete(CANARY_KEY).then(() => "resolved", (e: unknown) =>
+      `threw ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`.slice(0, 300)); // a refusal is the expected outcome
     if (!(await env.COPY.head(CANARY_KEY))) {
       canary = "DELETED";
       failures.push("the locked canary was deleted: the bucket lock is not working");
@@ -133,7 +137,7 @@ export async function runNight(env: Env, deps: Deps, now: Date) {
   } while (cursor);
 
   // Error text can quote a URL or key; nothing secret goes on to the log, the phone or healthchecks.
-  const report = { date, ok: failures.length === 0, objects: night.length, copied, skipped, bytes, storedBytes, canary, failures: failures.map((f) => redact(f, env)) };
+  const report = { date, ok: failures.length === 0, objects: night.length, copied, skipped, bytes, storedBytes, canary, canaryDelete: redact(canaryDelete, env), failures: failures.map((f) => redact(f, env)) };
   console.log(JSON.stringify(report));
   // Only a fully verified night pings "up". A failed night sends one alert (phone, else healthchecks
   // /fail), and healthchecks hears /fail either way so the dead-man check stays true.
