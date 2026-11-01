@@ -23,13 +23,14 @@ function storage() {
 }
 // The records bucket in memory: head and put, with a switch to make puts fail.
 function bucket() {
-  const store = new Map<string, { body: string; sha?: string }>();
+  const store = new Map<string, { body: string; sha?: string; raw?: Uint8Array }>();
   let failPuts = 0;
   return {
     store,
     failNext(n = 1) { failPuts = n; },
     async head(k: string) { const v = store.get(k); return v ? ({ key: k, customMetadata: { sha256: v.sha } } as unknown as R2Object) : null; },
-    async get(k: string) { const v = store.get(k); return v ? ({ key: k, text: async () => v.body } as unknown as R2ObjectBody) : null; },
+    async get(k: string) { const v = store.get(k); return v ? ({ key: k, text: async () => v.body, arrayBuffer: async () => (v.raw ?? new TextEncoder().encode(v.body)).buffer } as unknown as R2ObjectBody) : null; },
+    async list(o: { prefix?: string; limit?: number }) { return { objects: [...store.keys()].sort().filter((k) => k.startsWith(o.prefix ?? "")).slice(0, o.limit ?? 1000).map((key) => ({ key })), truncated: false, delimitedPrefixes: [] } as unknown as R2Objects; },
     async put(k: string, body: string, o?: R2PutOptions) {
       if (failPuts > 0) { failPuts--; throw new Error("R2 down"); }
       store.set(k, { body, sha: o?.customMetadata?.sha256 });
@@ -238,6 +239,51 @@ test("Codex r1: after a long outage the record takes the time it is stored, and 
   assert.equal(retry.receipt.recorded_at, env.recorded_at);
   assert.equal(b.store.get(retry.receipt.key)!.sha, await sha256(b.store.get(retry.receipt.key)!.body));
   assert.ok(SKEW_MS < 60 * MIN);
+});
+
+test("Codex r2: a write held over midnight by an outage is charged to the day it is stored; no day exceeds the cap", async () => {
+  const st = storage(), b = bucket(), l = new Ledger(st, b);
+  const eve = () => new Date("2026-11-01T23:59:00Z"), morn = () => new Date("2026-11-02T00:30:00Z");
+  // 100 grants finished before midnight (399 records), the last result held by an outage.
+  for (let i = 0; i < DAY_CAP / STAGE_SLOTS; i++) {
+    const g = `grant-e${String(i).padStart(4, "0")}`, r = rec("request", {}, g), h = await sha256(r);
+    await l.accept(r, eve);
+    for (const stg of ["approval", "verdict", "result"]) {
+      if (i === DAY_CAP / STAGE_SLOTS - 1 && stg === "result") b.failNext();
+      await l.accept(rec(stg, { request: h }, g), eve);
+    }
+  }
+  // After midnight: 100 new grants try to run in full; the held result is stored first.
+  for (let i = 0; i < DAY_CAP / STAGE_SLOTS; i++) {
+    const g = `grant-m${String(i).padStart(4, "0")}`, r = rec("request", {}, g), h = await sha256(r);
+    if ((await l.accept(r, morn)).status !== 201) continue;
+    for (const stg of ["approval", "verdict", "result"]) await l.accept(rec(stg, { request: h }, g), morn);
+  }
+  const nov2 = [...b.store.values()].filter((v) => (JSON.parse(v.body) as Envelope).recorded_at.startsWith("2026-11-02")).length;
+  assert.ok(nov2 <= DAY_CAP, `${nov2} records stored on 2026-11-02`);
+  assert.ok((await l.status(morn())).used_today <= DAY_CAP);
+});
+
+test("Codex r2: recovery compares the stored object's raw bytes, not its decoded text", async () => {
+  const st = storage(), b = bucket(), l = new Ledger(st, b);
+  b.failNext();
+  await l.accept(rec("request", { note: "\ufffd" }), at(0));
+  const p = st.m.get("pending") as { key: string; stored: string; storedSha: string };
+  // Same decoded text, different bytes: an invalid byte where the real record has U+FFFD.
+  const raw = new TextEncoder().encode(p.stored), fffd = [0xef, 0xbf, 0xbd];
+  const at3 = raw.findIndex((_, i) => fffd.every((x, k) => raw[i + k] === x));
+  const forged = new Uint8Array([...raw.slice(0, at3), 0xff, ...raw.slice(at3 + 3)]);
+  b.store.set(p.key, { body: p.stored, sha: p.storedSha, raw: forged });
+  const o = await l.accept(rec("request", {}, "grant-0002"), at(1));
+  assert.equal(o.status, 503);
+});
+
+test("Codex r2: an object planted ahead under the recorder's next number stops the recorder until Ben looks", async () => {
+  const st = storage(), b = bucket(), l = new Ledger(st, b);
+  b.store.set("records/v1/000000000001.grant-planted.request.json", { body: "{}" });
+  const o = await l.accept(rec("request"), at(0));
+  assert.deepEqual([o.status, "why" in o && o.why], [503, "the next record's number is taken by an object the recorder did not write: Ben must look"]);
+  assert.equal(b.store.has(keyFor(1, G, "request")), false);
 });
 
 test("simultaneous writes are taken one at a time: no shared sequence number, no lost update", async () => {

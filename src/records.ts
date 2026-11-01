@@ -12,7 +12,7 @@ export interface RecordsEnv extends AlertEnv, LockEnv {
   RECORDS?: Pick<R2Bucket, "list" | "get">; // read and list only: this job never writes there
   COPY: Pick<R2Bucket, "get" | "put">; // state/records.json lives in the copy bucket's unlocked state/
   PING_URL_RECORDS?: string; // this job's own healthchecks check; Ben creates it at the end of the build
-  RECORDS_HELD_ACK?: string; // record numbers Ben has looked at, e.g. "42,97": held numbers he clears (a setting only he sets)
+  RECORDS_HELD_ACK?: string; // for each held number, the copy Ben trusts, e.g. "42:grant-0001.request,97:grant-0002.result" (a setting only he sets)
 }
 
 export const RECORDS_BUCKET = "observatory-records"; // the RECORDS binding's bucket (wrangler.jsonc)
@@ -180,6 +180,11 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
           // (it cannot read the recorder's ledger, by design). The number is held: its copies are
           // checked now and every hour after (so the recorder's own is checked whenever it lands),
           // none counts toward a grant or a day, and reading goes on past it.
+          if (held.size >= MAX_HELD) {
+            verdict = "unverified";
+            reason = `${MAX_HELD} record numbers are already held: reading stopped at ${next} until Ben clears some`;
+            break;
+          }
           held.add(next);
           seq = next;
           checked++;
@@ -215,22 +220,45 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
         checked++;
       }
       if (checked === PAGE && verdict === "healthy") findings.push({ id: `backlog:${day(now)}`, text: `${PAGE} new records in an hour, over what the recorder can take: the rest are read next hour` });
-      // Held numbers: every copy re-checked each hour; the run stays unverified until Ben clears each.
-      const acked = new Set((env.RECORDS_HELD_ACK ?? "").split(",").map((x) => Number(x.trim())).filter((n) => Number.isInteger(n) && n > 0));
-      for (const n of [...held]) if (acked.has(n)) held.delete(n);
-      for (const n of [...held].sort((a, b) => a - b).slice(0, MAX_HELD)) {
-        const copies = (await namesAt(env.RECORDS, `${ROOT}${pad(n)}.`)).cands;
-        findings.push({ id: `duplicate-number:${n}`, text: `${copies.length} objects share record number ${n}: none is trusted; something wrote around the recorder` });
-        for (const o of copies) {
-          const m = KEY.exec(o.key)!;
-          const body = o.size > MAX_STORED_BYTES ? null : await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
-          const r = body === null ? undefined : await checkStored(n, m[2], m[3] as Stage, o.uploaded, body).catch(() => undefined);
-          if (r?.finding) findings.push({ ...r.finding, id: `${r.finding.id}:${m[2]}.${m[3]}` });
+      // Held numbers: every copy re-checked each hour; the run stays unverified until Ben clears each
+      // by naming the copy he trusts ("42:<grant>.<stage>"), which then joins the order and day checks.
+      const trusted = new Map<number, string>();
+      for (const part of (env.RECORDS_HELD_ACK ?? "").split(",")) {
+        const m = /^\s*(\d{1,12}):([A-Za-z0-9][A-Za-z0-9_-]{7,63}\.(?:request|approval|verdict|result))\s*$/.exec(part);
+        if (m) trusted.set(Number(m[1]), m[2]);
+      }
+      for (const n of [...held].sort((a, b) => a - b)) {
+        const here = await namesAt(env.RECORDS, `${ROOT}${pad(n)}.`);
+        for (const k of here.junk) findings.push(await stray(k));
+        if (here.capped) {
+          verdict = "unverified";
+          reason = `over ${MAX_NAMES_AT} names at held record number ${n}: it could not be read`;
+          continue;
         }
+        const pick = trusted.get(n);
+        let cleared = false;
+        for (const o of here.cands) {
+          const m = KEY.exec(o.key)!, grant = m[2], stage = m[3] as Stage, mine = pick === `${grant}.${stage}`;
+          const body = o.size > MAX_STORED_BYTES ? null : await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
+          const r = body === null ? undefined : await checkStored(n, grant, stage, o.uploaded, body).catch(() => undefined);
+          if (!r) findings.push({ id: `bad:${n}:${grant}.${stage}`, text: `record ${n} (${await fp(grant)}/${stage}): too large or could not be read` });
+          else if (r.finding) findings.push({ ...r.finding, id: `${r.finding.id}:${grant}.${stage}` });
+          else if (mine) {
+            // The copy Ben trusts joins the order and day checks, then the hold ends.
+            const f = checkOrder(open, grant, stage, r.job!, r.request, r.env!.sha256, o.uploaded.getTime(), n, await fp(grant));
+            if (f) findings.push(f);
+            const d = day(o.uploaded);
+            days[d] = (days[d] ?? 0) + 1;
+            cleared = true;
+          }
+        }
+        if (cleared) held.delete(n);
+        else findings.push({ id: `duplicate-number:${n}`, text: `${here.cands.length} objects share record number ${n}: none is trusted; something wrote around the recorder` });
       }
       if (held.size) {
         verdict = "unverified";
-        reason = `record number${held.size === 1 ? "" : "s"} ${[...held].sort((a, b) => a - b).slice(0, MAX_HELD).join(", ")}${held.size > MAX_HELD ? " and more" : ""} held (shared by several objects): reading goes on, but the run stays unverified until Ben clears ${held.size === 1 ? "it" : "them"} in RECORDS_HELD_ACK`;
+        const heldWhy = `record number${held.size === 1 ? "" : "s"} ${[...held].sort((a, b) => a - b).slice(0, MAX_HELD).join(", ")}${held.size > MAX_HELD ? " and more" : ""} held (shared by several objects): reading goes on, but the run stays unverified until Ben names the copy he trusts in RECORDS_HELD_ACK`;
+        reason = reason ? `${reason}; ${heldWhy}` : heldWhy;
       }
       findings.push(...(await strays(env.RECORDS)));
       if (now.getUTCHours() === SWEEP_HOUR) swept = await sweep(env.RECORDS, seq);

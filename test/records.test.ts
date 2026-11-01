@@ -201,48 +201,48 @@ test("security review: a stray name that sorts after every record is reported ea
   assert.match(second.reason, /something outside the record format/);
 });
 
-test("security review: a shared number is held -- reading goes on, every copy is re-checked hourly, days are not inflated, and only Ben clears it", async () => {
+test("security review: a shared number is held -- reading goes on, every copy is re-checked hourly, days are not inflated, and Ben clears it by naming the trusted copy", async () => {
   const b = bucket(), e = env(b), l = new Ledger(memory(), b);
   const req = rec("request"), h = await sha256(req);
   b.setClock(at(-10)); await l.accept(req, () => at(-10));
-  // Two objects planted at number 2 before the recorder gets there; one is broken.
-  await planted(b, 2, "grant-plant-a", "request", at(-9));
-  await planted(b, 2, "grant-plant-b", "request", at(-9), { envelope: { sha256: "0".repeat(64) } });
+  b.setClock(at(-9)); await l.accept(rec("approval", { request: h }), () => at(-9)); // the recorder's number 2
+  // Planted at number 2 after the recorder wrote it (the recorder refuses a number already taken).
+  await planted(b, 2, "grant-plant-a", "request", at(-8));
+  await planted(b, 2, "grant-plant-b", "request", at(-8), { envelope: { sha256: "0".repeat(64) } });
   const first = await runRecords(e, wire().fetch, NOW);
   assert.deepEqual([first.records, first.seq], ["unverified", 2]);
-  assert.match(first.reason, /record number 2 held \(shared by several objects\): reading goes on, but the run stays unverified until Ben clears it in RECORDS_HELD_ACK/);
-  // The recorder writes its own 2 (a third copy, checked too) and then 3, which is read normally.
-  b.setClock(at(1)); await l.accept(rec("approval", { request: h }), () => at(1));
-  b.setClock(at(2)); await l.accept(rec("verdict", { request: h }), () => at(2));
+  assert.match(first.reason, /record number 2 held \(shared by several objects\): reading goes on, but the run stays unverified until Ben names the copy he trusts in RECORDS_HELD_ACK/);
+  b.setClock(at(1)); await l.accept(rec("verdict", { request: h }), () => at(1)); // number 3, read normally
   const w = wire();
   const second = await runRecords(e, w.fetch, at(60));
   assert.deepEqual([second.records, second.seq, second.checked], ["unverified", 3, 1]);
-  assert.deepEqual(w.hc(), ["/rec/fail"]); // its own check keeps failing every hour while held
+  assert.deepEqual(w.hc(), ["/rec/fail"]);
   const state = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
   const ids = [...(state.alerted as string[]), ...(state.queued as { id: string }[]).map((f) => f.id)];
   assert.ok(ids.some((id) => id.startsWith("bad:2:") && id.endsWith("grant-plant-b.request")), ids.join(","));
   assert.equal(Object.values(state.days as Record<string, number>).reduce((x, y) => x + y, 0), 2); // records 1 and 3 only
-  // Ben looks and clears it: healthy again.
-  assert.equal((await runRecords({ ...e, RECORDS_HELD_ACK: " 2 " }, wire().fetch, at(120))).records, "healthy");
+  // A bare number clears nothing; naming the recorder's copy does, and that copy is then counted.
+  assert.equal((await runRecords({ ...e, RECORDS_HELD_ACK: "2" }, wire().fetch, at(120))).records, "unverified");
+  const ack = { ...e, RECORDS_HELD_ACK: " 2:grant-0001.approval " };
+  const done = await runRecords(ack, wire().fetch, at(180));
+  assert.equal(done.records, "findings"); // the planted broken copy is reported one last time
+  assert.equal((await runRecords(ack, wire().fetch, at(240))).records, "healthy");
+  assert.equal(Object.values(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).days as Record<string, number>).reduce((x, y) => x + y, 0), 3);
 });
 
-test("security review: junk names under the next number cannot hide the real record there", async () => {
+test("security review: junk names under a number cannot hide its real record, and at most 20 numbers are held", async () => {
   const b = bucket(), l = new Ledger(memory(), b);
-  for (const j of ["a", "aa", "aaa", "b"]) b.add(`records/v1/000000000001.${j}`, "{}", at(-11));
   b.setClock(at(-10)); await l.accept(rec("request"), () => at(-10));
+  for (const j of ["a", "aa", "aaa", "b"]) b.add(`records/v1/000000000001.${j}`, "{}", at(-9)); // junk sorting before it
   const r = await runRecords(env(b), wire().fetch, NOW);
   assert.deepEqual([r.checked, r.seq], [1, 1]);
   assert.match(r.reason, /something outside the record format/);
-});
-
-test("security review: a flood of junk names right after the bookmark cannot stall the reading of real records", async () => {
-  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
-  const req = rec("request"), h = await sha256(req);
-  b.setClock(at(-10)); await l.accept(req, () => at(-10));
-  for (let i = 0; i < PAGE + 100; i++) b.add(`records/v1/000000000001~junk${String(i).padStart(4, "0")}`, "{}", at(-9));
-  b.setClock(at(-8)); await l.accept(rec("approval", { request: h }), () => at(-8));
-  const r = await runRecords(e, wire().fetch, NOW);
-  assert.deepEqual([r.checked, r.seq], [2, 2]);
+  // 21 shared numbers in a row: the 21st stops the read, unverified.
+  const b2 = bucket();
+  for (let n = 1; n <= 21; n++) { await planted(b2, n, `grant-x${String(n).padStart(4, "0")}`, "request", at(-5)); await planted(b2, n, `grant-y${String(n).padStart(4, "0")}`, "request", at(-5)); }
+  const r2 = await runRecords(env(b2), wire().fetch, NOW);
+  assert.equal(r2.seq, 20);
+  assert.match(r2.reason, /20 record numbers are already held: reading stopped at 21 until Ben clears some/);
 });
 
 test("Codex r1 B8: grant ids never appear in alert text, only their fingerprints", async () => {
@@ -255,6 +255,18 @@ test("Codex r1 B8: grant ids never appear in alert text, only their fingerprints
   // 64 bits of SHA-256: no grant id can be made to show another grant's fingerprint.
   assert.equal(await fp("grant-0001"), `#${(await sha256("grant-0001")).slice(0, 16)}`);
 });
+
+
+test("security review: a flood of junk names right after the bookmark cannot stall the reading of real records", async () => {
+  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
+  const req = rec("request"), h = await sha256(req);
+  b.setClock(at(-10)); await l.accept(req, () => at(-10));
+  for (let i = 0; i < PAGE + 100; i++) b.add(`records/v1/000000000001~junk${String(i).padStart(4, "0")}`, "{}", at(-9));
+  b.setClock(at(-8)); await l.accept(rec("approval", { request: h }), () => at(-8));
+  const r = await runRecords(e, wire().fetch, NOW);
+  assert.deepEqual([r.checked, r.seq], [2, 2]);
+});
+
 
 test("security review: grant ids that are built-in object names cannot crash or corrupt the checker", async () => {
   const b = bucket();

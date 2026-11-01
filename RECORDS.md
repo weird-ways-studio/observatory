@@ -37,12 +37,12 @@ it cannot detect a secret under an innocent name, so the front desk redacts (pha
 | Answer | Why |
 |---|---|
 | 401 / 403 | no valid edge-login token, or not the front desk (Ben may read status, not write) |
-| 503 | its edge-login settings are missing; Access's keys unreadable; a write pending that the bucket has not taken yet (retry); or its next name taken by an object it did not write (stops until Ben looks) |
+| 503 | its edge-login settings are missing; Access's keys unreadable; a write pending that the bucket has not taken yet (retry); or anything it did not write already sitting under its next record number (stops until Ben looks) |
 | 413 | over 8192 bytes, counted as the body arrives |
 | 400 | outside the record format above (a fixed reason, never the writer's own text) |
 | 409 | approval or verdict with no recorded request; result with no recorded approval; wrong request hash or job; this stage already recorded with other content |
 | 410 | the grant's request is over 24 hours old |
-| 429 | today's 400 slots (UTC day) are taken, or the lifetime storage budget (1 GiB of stored envelopes) is full. A request takes 4 slots and reserves room in the budget for its grant's other three stages, so admitted grants can always finish. A new day starts with the slots still reserved by grants opened the day before, never at zero, so no UTC day stores more than 400 records. A full budget refuses every request until Ben decides. |
+| 429 | today's 400 slots (UTC day) are taken, or the lifetime storage budget (1 GiB of stored envelopes) is full. A request takes 4 slots and reserves room in the budget for its grant's other three stages, so admitted grants can always finish. A new day starts with the slots still reserved by grants opened the day before, never at zero, so no UTC day stores more than 400 records; a write held over midnight by an outage is charged to the day it is finally stored. A full budget refuses every request until Ben decides. |
 
 The same bytes sent again for a recorded stage get the same receipt (200), so a lost answer is
 safe to retry. A new record gets 201 and its receipt:
@@ -75,7 +75,9 @@ an hour; more is itself a finding). Two objects with one number: the checker can
 is the recorder's (by design it cannot read the recorder's ledger), so the number is held. Reading
 goes on past it; every copy at a held number is re-checked every hour, so the recorder's own is
 checked whenever it lands; none counts toward a grant or a day; and the run stays unverified until
-Ben adds the number to the `RECORDS_HELD_ACK` setting (comma-separated) after looking. A missing number with a
+Ben names the copy he trusts in the `RECORDS_HELD_ACK` setting, as `<number>:<grant>.<stage>`
+(comma-separated); that copy then joins the order and day checks. At most 20 numbers are held;
+the 21st stops the read, unverified. A missing number with a
 higher one present is a standing gap finding. For each record: the name, the size, the envelope against the name and R2's upload time (within
 10 minutes), the hash, the record against this contract, and the order of each grant's stages
 (no duplicates, request first, approval before result, same request and job). Also: any gap in

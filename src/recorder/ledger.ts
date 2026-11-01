@@ -13,7 +13,7 @@ export interface Storage {
   put(entries: Record<string, unknown>): Promise<void>;
   delete(key: string): Promise<boolean>;
 }
-export type Bucket = Pick<R2Bucket, "get" | "put">;
+export type Bucket = Pick<R2Bucket, "get" | "put" | "list">;
 
 // An open grant still holds `left` reserved slots for its later stages, whatever day they land on.
 interface Open { grant: string; opened: number; left: number }
@@ -21,7 +21,7 @@ interface Open { grant: string; opened: number; left: number }
 // grants opened yesterday). `bytes`: every stored envelope's size, for the lifetime budget.
 interface Meta { seq: number; day: string; used: number; bytes: number; open: Open[] }
 interface Grant { job: string; request: string; opened: number; stages: Partial<Record<Stage, Receipt>> }
-interface Pending { key: string; stored: string; storedSha: string; receipt: Receipt }
+interface Pending { key: string; stored: string; storedSha: string; receipt: Receipt; day: string } // `day`: the UTC day its slot was charged to
 
 export type Outcome =
   | { status: 200 | 201; receipt: Receipt }
@@ -106,7 +106,7 @@ export class Ledger {
     const receipt: Receipt = { v: 1, seq, key, grant: r.grant, stage: r.stage, sha256: sha, recorded_at: now.toISOString() };
     const envelope: Envelope = { v: 1, seq, grant: r.grant, stage: r.stage, recorded_at: receipt.recorded_at, sha256: sha, body };
     const stored = JSON.stringify(envelope);
-    const pending: Pending = { key, stored, storedSha: await sha256(stored), receipt };
+    const pending: Pending = { key, stored, storedSha: await sha256(stored), receipt, day: meta.day };
     // Counted, ordered and queued in one atomic step, before the bucket is touched.
     await this.storage.put({
       meta: { ...meta, seq, bytes: meta.bytes + new TextEncoder().encode(stored).length },
@@ -124,20 +124,35 @@ export class Ledger {
     let p = await this.storage.get<Pending>("pending");
     if (!p) return undefined;
     try {
-      const there = await this.bucket.get(p.key);
+      // Nothing but this record may sit under its number. Something else there (planted ahead of
+      // the recorder) would let a checker read it as this number's record: stop until Ben looks.
+      const prefix = p.key.slice(0, p.key.indexOf(".") + 1);
+      const here = (await this.bucket.list({ prefix, limit: 10 })).objects.map((o) => o.key);
+      if (here.some((k) => k !== p!.key)) return "the next record's number is taken by an object the recorder did not write: Ben must look";
+      const there = here.includes(p.key) ? await this.bucket.get(p.key) : null;
       if (there) {
-        // Stored before a crash: fine only if its bytes are ours. Anything else means someone else
-        // wrote under the recorder's next name -- stop taking records until Ben looks.
-        if ((await sha256(await there.text())) !== p.storedSha) return "the next record's name is taken by an object the recorder did not write: Ben must look";
+        // Stored before a crash: fine only if its raw bytes are ours.
+        if ((await sha256(new Uint8Array(await there.arrayBuffer()))) !== p.storedSha) return "the next record's name is taken by an object the recorder did not write: Ben must look";
       } else {
         if (now.getTime() - Date.parse(p.receipt.recorded_at) > SKEW_MS / 2) {
           // Stored late (the bucket was down): no receipt has gone out, so it takes the time it is
           // actually stored, and its receipt says the same.
           const receipt = { ...p.receipt, recorded_at: now.toISOString() };
           const stored = JSON.stringify({ ...(JSON.parse(p.stored) as Envelope), recorded_at: receipt.recorded_at });
-          p = { ...p, stored, storedSha: await sha256(stored), receipt };
           const g = (await this.storage.get<Grant>(`g:${receipt.grant}`))!;
-          await this.storage.put({ pending: p, [`g:${receipt.grant}`]: { ...g, stages: { ...g.stages, [receipt.stage]: receipt } } });
+          const writes: Record<string, unknown> = { [`g:${receipt.grant}`]: { ...g, stages: { ...g.stages, [receipt.stage]: receipt } } };
+          let charged = p.day;
+          if (day(now.getTime()) !== p.day) {
+            // Stored on a later UTC day: it is charged to that day. Nothing else is taken while a
+            // record is pending, so this is the day's first write, after the carried reservations.
+            const m = rollover((await this.storage.get<Meta>("meta"))!, now.getTime());
+            if (m.used + 1 > DAY_CAP) return `today's ${DAY_CAP} record slots are taken; the pending record waits`;
+            writes.meta = { ...m, used: m.used + 1 };
+            charged = m.day;
+          }
+          p = { ...p, stored, storedSha: await sha256(stored), receipt, day: charged };
+          writes.pending = p;
+          await this.storage.put(writes);
         }
         await this.bucket.put(p.key, p.stored, { customMetadata: { sha256: p.storedSha }, httpMetadata: { contentType: "application/json" } });
       }
