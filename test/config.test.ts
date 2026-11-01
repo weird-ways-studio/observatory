@@ -36,7 +36,7 @@ test("only the reviewed keys: no vars, no build step, nothing beyond phase 2c", 
 test("it reaches only its own copy bucket: once a night for backups, hourly for freshness", () => {
   assert.deepEqual(config.r2_buckets, [{ binding: "COPY", bucket_name: "observatory-backups" }]);
   assert.deepEqual(config.triggers, { crons: [NIGHT_CRON, FRESH_CRON] });
-  assert.deepEqual([NIGHT_CRON, FRESH_CRON], ["50 3 * * *", "30 * * * *"]);
+  assert.deepEqual([NIGHT_CRON, FRESH_CRON], ["15 3 * * *", "30 * * * *"]);
 });
 
 test("anything that does reach it gets 404", async () => {
