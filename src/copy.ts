@@ -29,6 +29,9 @@ export interface Listed {
 // A permanently locked object. Each night the Worker tries to delete it; if it is ever gone,
 // the lock is gone too, and the night fails.
 export const CANARY_KEY = "canary/do-not-delete";
+// R2's own answer when a bucket lock refuses a delete, as the live night logged it (canaryDelete,
+// 2026-11-01 03:15 UTC). Only this answer proves the lock; any other error proves nothing (card f0d4e2fc).
+export const LOCK_REFUSAL = /: The object is locked by the bucket policy\. \(10069\)$/;
 // The c-box names each night's folder by its own local date (backup_engine.py).
 const BACKUP_TIME_ZONE = "America/Chicago";
 
@@ -114,8 +117,7 @@ export async function runNight(env: Env, deps: Deps, now: Date) {
   }
 
   let canary = "refused";
-  // What the delete answered, word for word, so the lock-refusal check can be written to count
-  // only R2's real refusal (card f0d4e2fc; the docs do not say what the binding returns).
+  // What the delete answered, word for word, logged so a change in R2's answer is visible.
   let canaryDelete = "not tried";
   try {
     if (!(await env.COPY.head(CANARY_KEY))) await env.COPY.put(CANARY_KEY, "locked forever; deleting it must fail");
@@ -124,6 +126,10 @@ export async function runNight(env: Env, deps: Deps, now: Date) {
     if (!(await env.COPY.head(CANARY_KEY))) {
       canary = "DELETED";
       failures.push("the locked canary was deleted: the bucket lock is not working");
+    } else if (!LOCK_REFUSAL.test(canaryDelete)) {
+      // Still there, but not because the lock said no (an outage, or a delete that lands later).
+      canary = "unverified";
+      failures.push("the canary delete was not refused by the lock, so the lock is unproven tonight");
     }
   } catch (e) {
     canary = "error";
