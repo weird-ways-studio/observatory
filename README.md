@@ -6,7 +6,7 @@ Today it does two jobs: a second, locked copy of the studio's nightly backups (p
 
 ## Nightly backup copy (phase 2c, card 202ac367)
 
-At 03:15 UTC (temporary, to test the first night) (`triggers` in `wrangler.jsonc`), `src/copy.ts` runs:
+At 03:15 UTC, 9:15 pm Chicago time in winter (`triggers` in `wrangler.jsonc`), `src/copy.ts` runs:
 
 1. Lists that night's backup objects in the main backup bucket, with a read-only key scoped to that one bucket. The objects are encrypted before upload, so the Observatory cannot read them.
 2. Copies each one into this account's own bucket. R2 refuses a copy whose bytes do not hash to the source's MD5, and the Worker checks the result again. A source object without a plain MD5 fails the night rather than go unchecked.

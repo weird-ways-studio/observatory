@@ -7,12 +7,15 @@ const md5 = (data: string) => createHash("md5").update(data).digest("hex");
 const buf = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex")).buffer;
 const NOW = new Date("2026-10-31T11:00:00Z");
 const DATE = "2026-10-31";
+// R2's real refusal text, as the live night logged it (2026-11-01 03:15 UTC).
+const REFUSAL = "delete: The object is locked by the bucket policy. (10069)";
 
 // A stand-in for an R2 bucket with the copy bucket's lock rules: nothing under daily/ or canary/
 // can be overwritten, and a canary delete is refused unless the test removes the lock.
 class FakeBucket {
   store = new Map<string, string>();
   lockDeletes = true;
+  deleteError = new Error(REFUSAL);
   async head(key: string) {
     const v = this.store.get(key);
     return v === undefined ? null : { size: v.length, checksums: { md5: buf(md5(v)) } };
@@ -25,7 +28,7 @@ class FakeBucket {
     return { size: text.length, checksums: { md5: buf(md5(text)) } };
   }
   async delete(key: string) {
-    if (this.lockDeletes) throw new Error("delete: object is locked");
+    if (this.lockDeletes) throw this.deleteError;
     this.store.delete(key);
   }
   async list() {
@@ -108,7 +111,7 @@ test("a good night copies only tonight's objects, verifies them, and pings up", 
   assert.equal(n.bucket.store.get(tonight[0].key), "brain bytes");
   assert.equal(n.bucket.store.has(tonight[2].key), false);
   assert.equal(report.canary, "refused");
-  assert.equal(report.canaryDelete, "threw Error: delete: object is locked");
+  assert.equal(report.canaryDelete, `threw Error: ${REFUSAL}`);
   assert.deepEqual(n.pings, ["/check"]);
 });
 
@@ -163,6 +166,24 @@ test("if the locked canary can be deleted, the night fails", async () => {
   assert.equal(report.canary, "DELETED");
   assert.equal(report.canaryDelete, "resolved");
   assert.equal(n.bucket.store.has(CANARY_KEY), false);
+  assert.deepEqual(n.pings, ["/check/fail"]);
+});
+
+test("a canary delete that fails for any other reason leaves the lock unproven and fails the night", async () => {
+  const n = night(tonight);
+  n.bucket.deleteError = new Error("internal error; please retry");
+  const report = await n.run();
+  assert.equal(report.canary, "unverified");
+  assert.equal(n.bucket.store.has(CANARY_KEY), true);
+  assert.deepEqual(n.pings, ["/check/fail"]);
+});
+
+test("a canary delete that resolves without removing it leaves the lock unproven", async () => {
+  const n = night(tonight);
+  n.bucket.delete = async () => {};
+  const report = await n.run();
+  assert.equal(report.canary, "unverified");
+  assert.equal(report.canaryDelete, "resolved");
   assert.deepEqual(n.pings, ["/check/fail"]);
 });
 
