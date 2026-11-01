@@ -15,7 +15,7 @@ The repo lives in the `weird-ways-observatory` org, which no agent credential ca
 2. Ben opens the PR from that link in Safari, signed in as `weird-ways`.
 3. Ben approves and merges in the GitHub app as `benculbert`. Any push after his approval cancels it (ruleset `protect-main`), so the agent never pushes to a branch Ben has approved.
 
-Until cutover, agents open PRs on `weird-ways-studio/observatory` directly.
+Agents have no direct route: the old `weird-ways-studio/observatory` address only redirects here, and pushes to this repo are refused.
 
 ## Release Checklist
 
