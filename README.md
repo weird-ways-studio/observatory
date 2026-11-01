@@ -2,7 +2,7 @@
 
 The studio's independent check on its agents. It will record every request agents make through the Front Desk before it runs, read what the providers say changed, and alert Ben on anything that does not match. Only code Ben approved ever runs here.
 
-Today it does two jobs: a second, locked copy of the studio's nightly backups (phase 2c), and an hourly check that what runs here is what is on `main` (card f0d4e2fc).
+Today it does three jobs: a second, locked copy of the studio's nightly backups (phase 2c), an hourly check that what runs here is what is on `main` (card f0d4e2fc), and an hourly check of the front desk's add-only records (phase 2a, card feea07eb).
 
 ## Nightly backup copy (phase 2c, card 202ac367)
 
@@ -15,6 +15,10 @@ At 03:15 UTC, 9:15 pm Chicago time in winter (`triggers` in `wrangler.jsonc`), `
 5. Pings the dead-man check "up" only if every step passed; otherwise it reports a failure, so Ben gets an email. A missed night also emails him.
 
 The copy bucket's lock rules keep each night for 30 days (D2, Ben 2026-10-31; the canary forever); a lifecycle rule then removes it. Lock rules win over lifecycle rules, and the Worker's own code cannot delete a locked object. One log line per night records counts, bytes, total stored bytes, the canary result and the lock-length verdict.
+
+## Hourly records check (phase 2a, card feea07eb)
+
+The front desk records each grant's request, verdict, approval and result in the `observatory-records` bucket before it acts; the format is in `RECORDS.md`. A lock rule on `records/` makes that bucket add-only. At :30 past every hour, as a job separate from the freshness check, `src/records.ts` reads today's and yesterday's records and reports anything outside the contract, any result without an earlier request and approval, backdated or oversized records, a day over 400 records, and a lock on `records/` shorter than 400 days. Each finding alerts once through Pushover, falling back to this job's own check (`PING_URL_RECORDS`); state lives at `state/records.json` in the copy bucket. Until `PING_URL_RECORDS` is set it only logs. It reads; it never writes to the records bucket.
 
 ## Hourly freshness check (card f0d4e2fc)
 

@@ -26,34 +26,34 @@ function holds(c: Condition, now: Date): number {
   return NaN;
 }
 
-/** OK only if an enabled rule covers all of `daily/` for 30 days and no enabled rule there is shorter. */
-export function judgeRules(rules: Rule[], now: Date): LockLength {
+/** OK only if an enabled rule covers all of `locked` for `min` seconds and no enabled rule there is shorter. */
+export function judgeRules(rules: Rule[], now: Date, locked = LOCKED_PREFIX, min = MIN_LOCK_SECONDS): LockLength {
   const days = (s: number) => `${Math.floor(s / 86_400)} days`;
   let covered = false;
   for (const r of rules.filter((x) => x.enabled)) {
     const prefix = r.prefix ?? "";
-    const coversAll = LOCKED_PREFIX.startsWith(prefix);
-    if (!coversAll && !prefix.startsWith(LOCKED_PREFIX)) continue; // another prefix, e.g. canary/
+    const coversAll = locked.startsWith(prefix);
+    if (!coversAll && !prefix.startsWith(locked)) continue; // another prefix, e.g. canary/
     const s = holds(r.condition, now);
     if (Number.isNaN(s)) return { verdict: "unverified", reason: `lock rule on "${prefix}" has an unknown condition` };
-    if (s < MIN_LOCK_SECONDS) return { verdict: "short", reason: `lock rule on "${prefix}" holds ${days(s)}, under ${days(MIN_LOCK_SECONDS)}` };
+    if (s < min) return { verdict: "short", reason: `lock rule on "${prefix}" holds ${days(s)}, under ${days(min)}` };
     if (coversAll) covered = true;
   }
-  return covered ? { verdict: "ok" } : { verdict: "short", reason: `no enabled lock rule covers ${LOCKED_PREFIX}` };
+  return covered ? { verdict: "ok" } : { verdict: "short", reason: `no enabled lock rule covers ${locked}` };
 }
 
-/** Reads the copy bucket's lock rules with the read-only key and judges them. */
-export async function readLockLength(env: LockEnv, fetchFn: (req: Request) => Promise<Response>, now: Date): Promise<LockLength> {
+/** Reads a bucket's lock rules (the copy bucket unless told otherwise) with the read-only key and judges them. */
+export async function readLockLength(env: LockEnv, fetchFn: (req: Request) => Promise<Response>, now: Date, bucket = COPY_BUCKET, locked = LOCKED_PREFIX, min = MIN_LOCK_SECONDS): Promise<LockLength> {
   const token = env.LOCK_READ_TOKEN?.trim(), account = env.LOCK_ACCOUNT_ID?.trim();
   if (!token || !account) return { verdict: "not set up" };
-  const url = `https://api.cloudflare.com/client/v4/accounts/${account}/r2/buckets/${COPY_BUCKET}/lock`;
+  const url = `https://api.cloudflare.com/client/v4/accounts/${account}/r2/buckets/${bucket}/lock`;
   try {
     const res = await fetchFn(new Request(url, { headers: { Authorization: `Bearer ${token}` } }));
     if (!res.ok) return { verdict: "unverified", reason: `reading the lock rules answered ${res.status}` };
     const body = (await res.json()) as { success?: boolean; result?: { rules?: unknown } };
     const rules = body?.result?.rules;
     if (body?.success !== true || !Array.isArray(rules)) return { verdict: "unverified", reason: "the lock rules answer was not understood" };
-    return judgeRules(rules as Rule[], now);
+    return judgeRules(rules as Rule[], now, locked, min);
   } catch {
     // Fixed words: a thrown fetch error could quote the URL, which holds the account id.
     return { verdict: "unverified", reason: "the lock rules could not be read" };

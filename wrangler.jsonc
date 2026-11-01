@@ -8,6 +8,8 @@
 // SOURCE_ENDPOINT, SOURCE_BUCKET, PING_URL, and for phase 2b alerts (card 9a6ed286)
 // PUSHOVER_TOKEN, PUSHOVER_USER, for the hourly freshness check (card f0d4e2fc) PING_URL_FRESH,
 // and for the nightly lock-length check (src/lock.ts) LOCK_READ_TOKEN, LOCK_ACCOUNT_ID.
+// Phase 2a (card feea07eb): RECORDS -> observatory-records, the broker's add-only records, read
+// hourly by src/records.ts, which reports to its own check PING_URL_RECORDS (a secret).
 // Wrangler deploys never delete them. DEPLOYED_SHA comes from the deploy command (--var), not here.
 // test/config.test.ts fails if any of that changes; widen it only in a reviewed PR.
 // Comments here stay on their own lines: the test reads this file as JSON after dropping them.
@@ -19,6 +21,9 @@
   "preview_urls": false,
   "send_metrics": false,
   "triggers": { "crons": ["15 3 * * *", "30 * * * *"] },
-  "r2_buckets": [{ "binding": "COPY", "bucket_name": "observatory-backups" }],
+  "r2_buckets": [
+    { "binding": "COPY", "bucket_name": "observatory-backups" },
+    { "binding": "RECORDS", "bucket_name": "observatory-records" }
+  ],
   "observability": { "enabled": true }
 }
