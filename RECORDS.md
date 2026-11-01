@@ -72,14 +72,15 @@ it accepted them. Each object holds an envelope, with the writer's bytes untouch
 Every record stored since its last run, asking for the next expected number by name each time,
 so names elsewhere in the bucket cost nothing and cannot hide records still to come (at most 500
 an hour; more is itself a finding). Two objects with one number: each is checked, none counts for
-its grant, and the number is passed only once the next number exists. A missing number with a
+its grant, and reading stops there, unverified, every hour until Ben decides (the checker cannot
+tell which copy is the recorder's, by design). A missing number with a
 higher one present is a standing gap finding. For each record: the name, the size, the envelope against the name and R2's upload time (within
 10 minutes), the hash, the record against this contract, and the order of each grant's stages
 (no duplicates, request first, approval before result, same request and job). Also: any gap in
 the numbers, anything outside `records/v1/`, a UTC day over 400 records, and the lock on
 `records/` (once `LOCK_READ_TOKEN` exists). Once a day (04:30 UTC) it counts every record against
 the recorder's last number, which catches an object slipped in under an older name. Findings
-never repeat writer-chosen text: grant ids and unexpected names are shown as short fingerprints.
+never repeat writer-chosen text: grant ids and unexpected names are shown as fingerprints (the first 16 hex of their SHA-256), and grant findings name the record number.
 A lock it cannot read, including before `LOCK_READ_TOKEN` exists, is a finding, never healthy. Each finding
 alerts once, worst first; it counts as told only once a channel took the alert, and the rest are
 carried to the next hour. Until Ben sets `PING_URL_RECORDS`, it only logs.

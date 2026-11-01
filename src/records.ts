@@ -38,15 +38,11 @@ const tag = async (name: string) => (await sha256(name)).slice(0, 12);
 const stray = async (name: string): Promise<Finding> => { const t = await tag(name); return { id: `stray:${t}`, text: `something outside the record format, fingerprint ${t}` }; };
 const pad = (n: number) => String(n).padStart(12, "0");
 /**
- * How a grant id appears in alerts: a short fingerprint (FNV-1a), never the id itself, so a writer
- * cannot put words into Ben's alerts through its grant ids. Match it against a receipt's grant
- * with the same function; it identifies, it does not protect.
+ * How a grant id appears in alerts: the first 16 hex of its SHA-256, never the id itself, so a
+ * writer cannot put words into Ben's alerts, and cannot make one grant's fingerprint look like
+ * another's. Grant findings also name the record number, which settles any doubt.
  */
-export const fp = (grant: string) => {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < grant.length; i++) h = Math.imul(h ^ grant.charCodeAt(i), 0x01000193) >>> 0;
-  return `#${h.toString(16).padStart(8, "0")}`;
-};
+export const fp = async (grant: string) => `#${(await sha256(grant)).slice(0, 16)}`;
 // Worst first: what ran unrecorded or unchecked before what is merely malformed.
 const RANK = ["unrecorded", "unapproved", "approval-first", "mismatch", "duplicate", "duplicate-number", "foreign", "gap", "lock", "cap", "backlog", "verdict-first", "bad", "stray", "sweep"];
 const rank = (f: Finding) => { const i = RANK.indexOf(f.id.split(":")[0]); return i < 0 ? RANK.length : i; };
@@ -54,7 +50,8 @@ const isFinding = (f: unknown): f is Finding => typeof (f as Finding)?.id === "s
 
 /** Checks one stored record on its own: its envelope against its name and R2's upload time, then the writer's body. */
 export async function checkStored(seq: number, grant: string, stage: Stage, uploaded: Date, stored: string): Promise<{ finding?: Finding; env?: Envelope; job?: string; request?: string }> {
-  const bad = (why: string) => ({ finding: { id: `bad:${seq}`, text: `record ${seq} (${fp(grant)}/${stage}): ${why}` } });
+  const shown = await fp(grant);
+  const bad = (why: string) => ({ finding: { id: `bad:${seq}`, text: `record ${seq} (${shown}/${stage}): ${why}` } });
   let e: Envelope;
         try {
       e = JSON.parse(stored);
@@ -71,21 +68,21 @@ export async function checkStored(seq: number, grant: string, stage: Stage, uplo
 }
 
 /** The order check for one record, against the grants seen so far. Updates `open`. */
-export function checkOrder(open: Record<string, Open>, grant: string, stage: Stage, job: string, request: string | undefined, sha: string, at: number): Finding | undefined {
+export function checkOrder(open: Record<string, Open>, grant: string, stage: Stage, job: string, request: string | undefined, sha: string, at: number, n: number, shown: string): Finding | undefined {
   const g = Object.hasOwn(open, grant) ? open[grant] : undefined;
   if (stage === "request") {
-    if (g) return { id: `duplicate:${grant}:request`, text: `grant ${fp(grant)} has a second request record` };
+    if (g) return { id: `duplicate:${grant}:request`, text: `grant ${shown} (record ${n}) has a second request record` };
     open[grant] = { job, req: sha, at, stages: ["request"] };
     return undefined;
   }
   if (!g) {
-    if (stage === "result") return { id: `unrecorded:${grant}`, text: `grant ${fp(grant)} has a result with no request record before it: something ran unrecorded` };
-    return { id: `${stage === "approval" ? "approval-first" : "verdict-first"}:${grant}`, text: `grant ${fp(grant)} has a${stage === "approval" ? "n approval" : " verdict"} with no request record before it` };
+    if (stage === "result") return { id: `unrecorded:${grant}`, text: `grant ${shown} (record ${n}) has a result with no request record before it: something ran unrecorded` };
+    return { id: `${stage === "approval" ? "approval-first" : "verdict-first"}:${grant}`, text: `grant ${shown} (record ${n}) has a${stage === "approval" ? "n approval" : " verdict"} with no request record before it` };
   }
-  if (g.stages.includes(stage)) return { id: `duplicate:${grant}:${stage}`, text: `grant ${fp(grant)} has a second ${stage} record` };
+  if (g.stages.includes(stage)) return { id: `duplicate:${grant}:${stage}`, text: `grant ${shown} (record ${n}) has a second ${stage} record` };
   g.stages.push(stage);
-  if (request !== g.req || job !== g.job) return { id: `mismatch:${grant}`, text: `grant ${fp(grant)}: a later record names a different request or job than its request record` };
-  if (stage === "result" && !g.stages.includes("approval")) return { id: `unapproved:${grant}`, text: `grant ${fp(grant)} has a result with no approval record before it` };
+  if (request !== g.req || job !== g.job) return { id: `mismatch:${grant}`, text: `grant ${shown} (record ${n}): a later record names a different request or job than its request record` };
+  if (stage === "result" && !g.stages.includes("approval")) return { id: `unapproved:${grant}`, text: `grant ${shown} (record ${n}) has a result with no approval record before it` };
   return undefined;
 }
 
@@ -176,9 +173,8 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
           break;
         }
         if (cands.length > 1) {
-          // Objects share a number: the recorder wrote at most one. Each is checked on its own, none
-          // counts toward its grant's order, and the bookmark passes the number only once the next
-          // number exists -- proof the recorder has written its own -- so the real one is never skipped.
+          // Objects share a number: the recorder wrote at most one. Each is checked on its own and none
+          // counts toward its grant's order.
           findings.push({ id: `duplicate-number:${next}`, text: `${cands.length} objects share record number ${next}: none is trusted; something wrote around the recorder` });
           for (const o of cands) {
             const m = KEY.exec(o.key)!;
@@ -188,16 +184,19 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
             const d = day(o.uploaded);
             days[d] = (days[d] ?? 0) + 1;
           }
+          // The checker cannot tell which copy is the recorder's (it cannot read the recorder's ledger,
+          // by design), so it does not pass this number: the run stays unverified until Ben decides.
           checked++;
-          if (!(await namesAt(env.RECORDS, `${ROOT}${pad(next + 1)}.`)).cands.length) break;
-          seq = next;
-          continue;
+          verdict = "unverified";
+          reason = `record number ${next} has ${cands.length} objects: reading stopped there until Ben decides`;
+          break;
         }
         const o = cands[0], m = KEY.exec(o.key)!;
         const grant = m[2], stage = m[3] as Stage;
+        const shown = await fp(grant);
         try {
           if (o.size > MAX_STORED_BYTES) {
-            findings.push({ id: `bad:${next}`, text: `record ${next} (${fp(grant)}/${stage}): ${o.size} bytes, over ${MAX_STORED_BYTES}` });
+            findings.push({ id: `bad:${next}`, text: `record ${next} (${shown}/${stage}): ${o.size} bytes, over ${MAX_STORED_BYTES}` });
           } else {
             const body = await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
             if (body === null) {
@@ -209,12 +208,12 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
             const r = await checkStored(next, grant, stage, o.uploaded, body);
             if (r.finding) findings.push(r.finding);
             else {
-              const f = checkOrder(open, grant, stage, r.job!, r.request, r.env!.sha256, o.uploaded.getTime());
+              const f = checkOrder(open, grant, stage, r.job!, r.request, r.env!.sha256, o.uploaded.getTime(), next, shown);
               if (f) findings.push(f);
             }
           }
         } catch {
-          findings.push({ id: `bad:${next}`, text: `record ${next} (${fp(grant)}/${stage}): could not be checked` });
+          findings.push({ id: `bad:${next}`, text: `record ${next} (${shown}/${stage}): could not be checked` });
         }
         seq = next;
         const d = day(o.uploaded);
