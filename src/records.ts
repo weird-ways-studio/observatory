@@ -43,9 +43,9 @@ const isFinding = (f: unknown): f is Finding => typeof (f as Finding)?.id === "s
 export async function checkStored(seq: number, grant: string, stage: Stage, uploaded: Date, stored: string): Promise<{ finding?: Finding; env?: Envelope; job?: string; request?: string }> {
   const bad = (why: string) => ({ finding: { id: `bad:${seq}`, text: `record ${seq} (${grant}/${stage}): ${why}` } });
   let e: Envelope;
-  try {
-    e = JSON.parse(stored);
-  } catch {
+        try {
+      e = JSON.parse(stored);
+        } catch {
     return bad("not JSON");
   }
   if (!e || e.v !== 1 || e.seq !== seq || e.grant !== grant || e.stage !== stage) return bad("its envelope does not match its name");
@@ -59,7 +59,7 @@ export async function checkStored(seq: number, grant: string, stage: Stage, uplo
 
 /** The order check for one record, against the grants seen so far. Updates `open`. */
 export function checkOrder(open: Record<string, Open>, grant: string, stage: Stage, job: string, request: string | undefined, sha: string, at: number): Finding | undefined {
-  const g = open[grant];
+  const g = Object.hasOwn(open, grant) ? open[grant] : undefined;
   if (stage === "request") {
     if (g) return { id: `duplicate:${grant}:request`, text: `grant ${grant} has a second request record` };
     open[grant] = { job, req: sha, at, stages: ["request"] };
@@ -114,8 +114,9 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
     const saved = await env.COPY.get(STATE_KEY);
     if (saved) prev = JSON.parse(await saved.text());
   } catch { /* an unreadable state re-reads from the start and re-alerts at worst: safer than silence */ }
-  const open: Record<string, Open> = prev.open && typeof prev.open === "object" ? prev.open : {};
-  const days: Record<string, number> = prev.days && typeof prev.days === "object" ? prev.days : {};
+  // No prototype: a grant id can never reach a built-in object property.
+  const open: Record<string, Open> = Object.assign(Object.create(null), prev.open && typeof prev.open === "object" ? prev.open : {});
+  const days: Record<string, number> = Object.assign(Object.create(null), prev.days && typeof prev.days === "object" ? prev.days : {});
   let cursor = typeof prev.cursor === "string" ? prev.cursor : undefined, seq = Number.isInteger(prev.seq) ? prev.seq! : 0;
   let swept = Array.isArray(prev.swept) ? prev.swept.filter(isFinding).slice(0, MAX_SWEPT) : [];
   // A record is read once, so a finding not yet delivered is carried until it is.
@@ -130,13 +131,24 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
       const page = await env.RECORDS.list({ prefix: ROOT, startAfter: cursor, limit: PAGE });
       for (const o of page.objects) {
         const m = KEY.exec(o.key);
+        // The bookmark moves only to the next expected number, so no planted name can park it
+        // past the records still to come: a stray is reported every hour it stays in view, and a
+        // jump in the numbers stops the read there until it is resolved.
         if (!m) {
           const t = await tag(o.key);
           findings.push({ id: `stray:${t}`, text: `something outside the record format, fingerprint ${t}` });
-          cursor = o.key;
           continue;
         }
         const n = Number(m[1]), grant = m[2], stage = m[3] as Stage;
+        if (n <= seq) {
+          findings.push({ id: `gap:${n}:repeat`, text: `record number ${n} appeared after ${seq}: a name the recorder already used` });
+          continue;
+        }
+        if (n > seq + 1) {
+          findings.push({ id: `gap:${n}`, text: `record numbers jumped from ${seq} to ${n}: reading stops there until it is resolved` });
+          break;
+        }
+        try {
         if (o.size > MAX_STORED_BYTES) {
           findings.push({ id: `bad:${n}`, text: `record ${n} (${grant}/${stage}): ${o.size} bytes, over ${MAX_STORED_BYTES}` });
         } else {
@@ -154,8 +166,10 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
             if (f) findings.push(f);
           }
         }
-        if (n !== seq + 1) findings.push({ id: `gap:${n}`, text: `record numbers jumped from ${seq} to ${n}` });
-        seq = Math.max(seq, n);
+        } catch {
+          findings.push({ id: `bad:${n}`, text: `record ${n} (${grant}/${stage}): could not be checked` });
+        }
+        seq = n;
         const d = day(o.uploaded);
         days[d] = (days[d] ?? 0) + 1;
         cursor = o.key;

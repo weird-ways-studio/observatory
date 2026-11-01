@@ -54,6 +54,8 @@ test("contract: a good request passes; fixed reasons for each break, never the w
   assert.equal(why("[1]"), "not a JSON object");
   assert.equal(why(rec("request", { v: 2 })), "not version 1");
   assert.equal(why(rec("request", {}, "short")), "no valid grant id");
+  assert.equal(why(rec("request", {}, "__proto__")), "no valid grant id");
+  assert.equal(why(rec("request", {}, "-leading-dash")), "no valid grant id");
   assert.equal(why(rec("launch")), "no valid stage");
   assert.equal(why(rec("request", { job: "Bad Job" })), "no valid job name");
   assert.equal(why(rec("approval")), "no valid request hash");

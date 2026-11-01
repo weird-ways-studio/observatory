@@ -162,6 +162,47 @@ test("r1 #1 and r1 #8: names out of sequence are gaps; ties are impossible becau
   assert.match(await reasonOf(b), /record numbers jumped from 1 to 7/);
 });
 
+test("security review: a planted name past every record never parks the bookmark; later real records are still read", async () => {
+  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
+  b.add("records/v1/zzz-planted", "{}", at(-30));
+  await planted(b, 999_999_999_999, "grant-planted", "request", at(-30));
+  const req = rec("request"), h = await sha256(req);
+  b.setClock(at(-20));
+  await l.accept(req, () => at(-20));
+  const first = await runRecords(e, wire().fetch, NOW);
+  assert.equal(first.checked, 1);
+  // The stray sorts after the jump, so this hour stops before it; the jump alerts and the daily count covers both.
+  assert.match(first.reason, /record numbers jumped from 1 to 999999999999: reading stops there/);
+  // The next real records, numbered 2 and 3, are read on the next hour despite the planted names.
+  for (const [s, m] of [["approval", 1], ["result", 2]] as const) { b.setClock(at(m)); await l.accept(rec(s, { request: h }), () => at(m)); }
+  const second = await runRecords(e, wire().fetch, at(60));
+  assert.deepEqual([second.checked, second.seq], [2, 3]);
+  assert.match(second.reason, /reading stops there/); // still reported while it stays
+});
+
+test("security review: a stray name that sorts after every record is reported each hour and never hides new records", async () => {
+  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
+  b.add("records/v1/zzz-planted", "{}", at(-30));
+  const req = rec("request"), h = await sha256(req);
+  b.setClock(at(-20));
+  await l.accept(req, () => at(-20));
+  const first = await runRecords(e, wire().fetch, NOW);
+  assert.equal(first.checked, 1);
+  assert.match(first.reason, /something outside the record format/);
+  b.setClock(at(1));
+  await l.accept(rec("approval", { request: h }), () => at(1));
+  const second = await runRecords(e, wire().fetch, at(60));
+  assert.deepEqual([second.checked, second.seq], [1, 2]);
+  assert.match(second.reason, /something outside the record format/);
+});
+
+test("security review: grant ids that are built-in object names cannot crash or corrupt the checker", async () => {
+  const b = bucket();
+  await viaRecorder(b, ["constructor", "hasOwnProperty"]);
+  const r = await runRecords(env(b), wire().fetch, NOW);
+  assert.deepEqual([r.records, r.checked], ["healthy", 8]);
+});
+
 test("anything not named by the recorder is a stray, anywhere in the bucket, and its name is never repeated", async () => {
   const b = bucket();
   await viaRecorder(b);
