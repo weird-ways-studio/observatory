@@ -36,7 +36,9 @@ async function bounded(req: Request): Promise<string | undefined> {
   let at = 0;
   for (const c of chunks) { all.set(c, at); at += c.byteLength; }
   try {
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(all);
+    // ignoreBOM keeps a leading byte-order mark, so the text hashed is the bytes sent (and such a
+    // body then fails the JSON check instead of being silently changed).
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(all);
   } catch {
     return "\u0000not utf-8"; // fails the contract's JSON check with a fixed reason
   }

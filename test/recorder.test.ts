@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DAY_CAP, keyFor, MAX_RECORD_BYTES, sha256, STAGE_SLOTS, validate, type Envelope, type Receipt } from "../src/contract.ts";
+import { DAY_CAP, keyFor, MAX_RECORD_BYTES, MAX_STORED_BYTES, sha256, SKEW_MS, STAGE_SLOTS, STORE_BUDGET_BYTES, validate, type Envelope, type Receipt } from "../src/contract.ts";
 import { admit, resetCerts, type AccessEnv } from "../src/recorder/access.ts";
 import { handle } from "../src/recorder/http.ts";
 import { Ledger, type Storage } from "../src/recorder/ledger.ts";
@@ -29,6 +29,7 @@ function bucket() {
     store,
     failNext(n = 1) { failPuts = n; },
     async head(k: string) { const v = store.get(k); return v ? ({ key: k, customMetadata: { sha256: v.sha } } as unknown as R2Object) : null; },
+    async get(k: string) { const v = store.get(k); return v ? ({ key: k, text: async () => v.body } as unknown as R2ObjectBody) : null; },
     async put(k: string, body: string, o?: R2PutOptions) {
       if (failPuts > 0) { failPuts--; throw new Error("R2 down"); }
       store.set(k, { body, sha: o?.customMetadata?.sha256 });
@@ -180,9 +181,63 @@ test("the day's cap: requests reserve their grant's slots, so admitted grants ca
   // Every admitted grant can still record its approval: its slot was reserved.
   const h = await sha256(reqs[7]);
   assert.equal((await l.accept(rec("approval", { request: h }, "grant-0007"), at(1))).status, 201);
-  // Next UTC day, room again.
+  // Next UTC day: the open grants' reserved slots carry over (100 x 3 - 1 used), so only the rest is new room.
+  const carried = grants * (STAGE_SLOTS - 1) - 1;
   assert.equal((await l.accept(rec("request", {}, "grant-tomorrow"), () => new Date("2026-11-02T00:00:01Z"))).status, 201);
-  assert.deepEqual(await l.status(new Date("2026-11-02T01:00:00Z")), { seq: grants + 2, used_today: STAGE_SLOTS, cap: DAY_CAP, pending: false });
+  assert.deepEqual(await l.status(new Date("2026-11-02T01:00:00Z")), { seq: grants + 2, used_today: carried + STAGE_SLOTS, cap: DAY_CAP, stored_bytes: (await l.status(NOW)).stored_bytes, budget_bytes: STORE_BUDGET_BYTES, pending: false });
+});
+
+test("Codex r1: midnight does not reset the cap -- yesterday's open grants' slots carry over, so no UTC day takes more than the cap", async () => {
+  const st = storage(), b = bucket(), l = new Ledger(st, b);
+  const eve = () => new Date("2026-11-01T23:59:00Z"), morn = () => new Date("2026-11-02T00:01:00Z");
+  const hashes: [string, string][] = [];
+  for (let i = 0; i < DAY_CAP / STAGE_SLOTS; i++) {
+    const g = `grant-e${String(i).padStart(4, "0")}`, r = rec("request", {}, g);
+    assert.equal((await l.accept(r, eve)).status, 201);
+    hashes.push([g, await sha256(r)]);
+  }
+  // On the new day, new requests fit only in what yesterday's grants did not reserve.
+  let admitted = 0;
+  for (let i = 0; i < 100; i++) if ((await l.accept(rec("request", {}, `grant-m${String(i).padStart(4, "0")}`), morn)).status === 201) admitted++;
+  assert.equal(admitted, Math.floor((DAY_CAP - hashes.length * (STAGE_SLOTS - 1)) / STAGE_SLOTS));
+  // Every one of yesterday's grants can still finish today.
+  for (const [g, h] of hashes) for (const s of ["approval", "verdict", "result"]) assert.equal((await l.accept(rec(s, { request: h }, g), morn)).status, 201, `${g} ${s}`);
+  const today = [...b.store.keys()].length - hashes.length;
+  assert.ok(today <= DAY_CAP, `${today} records on one day`);
+});
+
+test("Codex r1: a lifetime storage budget; requests reserve room for their stages; full means refused until Ben decides", async () => {
+  const st = storage(), b = bucket(), l = new Ledger(st, b, 10 * MAX_STORED_BYTES);
+  assert.equal((await l.accept(rec("request", {}, "grant-b001"), at(0))).status, 201);
+  assert.equal((await l.accept(rec("request", {}, "grant-b002"), at(0))).status, 201);
+  const full = await l.accept(rec("request", {}, "grant-b003"), at(0));
+  assert.deepEqual([full.status, "why" in full && full.why], [429, "the recorder's storage budget is full: Ben must decide"]);
+  const h = await sha256(rec("request", {}, "grant-b001"));
+  assert.equal((await l.accept(rec("approval", { request: h }, "grant-b001"), at(1))).status, 201); // reserved room still works
+});
+
+test("Codex r1: recovery reads the stored bytes; a foreign object with a matching label is still refused", async () => {
+  const st = storage(), b = bucket(), l = new Ledger(st, b);
+  b.failNext();
+  await l.accept(rec("request"), at(0));
+  const p = st.m.get("pending") as { key: string; storedSha: string };
+  b.store.set(p.key, { body: "planted garbage", sha: p.storedSha }); // claims the right hash in its metadata
+  const o = await l.accept(rec("request", {}, "grant-0002"), at(1));
+  assert.deepEqual([o.status, "why" in o && o.why], [503, "the next record's name is taken by an object the recorder did not write: Ben must look"]);
+});
+
+test("Codex r1: after a long outage the record takes the time it is stored, and its receipt matches", async () => {
+  const st = storage(), b = bucket(), l = new Ledger(st, b);
+  const req = rec("request");
+  b.failNext();
+  assert.equal((await l.accept(req, at(0))).status, 503);
+  const retry = await l.accept(req, at(60));
+  assert.ok("receipt" in retry && retry.status === 200);
+  const env = JSON.parse(b.store.get(retry.receipt.key)!.body) as Envelope;
+  assert.equal(env.recorded_at, at(60)().toISOString());
+  assert.equal(retry.receipt.recorded_at, env.recorded_at);
+  assert.equal(b.store.get(retry.receipt.key)!.sha, await sha256(b.store.get(retry.receipt.key)!.body));
+  assert.ok(SKEW_MS < 60 * MIN);
 });
 
 test("simultaneous writes are taken one at a time: no shared sequence number, no lost update", async () => {
@@ -299,7 +354,12 @@ test("the address: two paths only; the login check runs before the body is read;
   assert.ok(pulled <= 4, `read ${pulled} chunks`);
   const notUtf8 = await go(withToken(svc, { body: new Uint8Array([0xff, 0xfe, 0x7b]) }));
   assert.equal(notUtf8.status, 400);
+  // Codex r1: a leading byte-order mark is kept, so the record fails as not JSON instead of being changed.
+  const bom = await go(withToken(svc, { body: new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(rec("request", {}, "grant-bom1"))]) }));
+  assert.deepEqual([bom.status, await bom.json()], [400, { error: "not JSON" }]);
 
   const status = await go(withToken(ben, { method: "GET" }, "/v1/status"));
-  assert.deepEqual(await status.json(), { seq: 1, used_today: STAGE_SLOTS, cap: DAY_CAP, pending: false });
+  const shown = (await status.json()) as Record<string, unknown>;
+  assert.deepEqual([shown.seq, shown.used_today, shown.cap, shown.pending, shown.budget_bytes], [1, STAGE_SLOTS, DAY_CAP, false, STORE_BUDGET_BYTES]);
+  assert.ok((shown.stored_bytes as number) > 0);
 });

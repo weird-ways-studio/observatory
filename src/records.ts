@@ -23,6 +23,7 @@ export const SWEEP_HOUR = 4; // UTC: once a day every name in the bucket is coun
 export const SWEEP_PAGES = 200; // up to 200,000 records counted; beyond that the sweep says so
 export const MAX_OPEN = 2_000; // grants remembered for the order check
 export const MAX_SWEPT = 50;
+export const MAX_NAMES_AT = 1_000; // names listed under one record number before the hour gives up as unverified
 export const MAX_QUEUED = 200; // findings not yet delivered, carried hour to hour, worst first
 
 /** One finding: `id` is stable across hours so Ben hears about it once. Text never holds writer-chosen words. */
@@ -36,6 +37,16 @@ const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const tag = async (name: string) => (await sha256(name)).slice(0, 12);
 const stray = async (name: string): Promise<Finding> => { const t = await tag(name); return { id: `stray:${t}`, text: `something outside the record format, fingerprint ${t}` }; };
 const pad = (n: number) => String(n).padStart(12, "0");
+/**
+ * How a grant id appears in alerts: a short fingerprint (FNV-1a), never the id itself, so a writer
+ * cannot put words into Ben's alerts through its grant ids. Match it against a receipt's grant
+ * with the same function; it identifies, it does not protect.
+ */
+export const fp = (grant: string) => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < grant.length; i++) h = Math.imul(h ^ grant.charCodeAt(i), 0x01000193) >>> 0;
+  return `#${h.toString(16).padStart(8, "0")}`;
+};
 // Worst first: what ran unrecorded or unchecked before what is merely malformed.
 const RANK = ["unrecorded", "unapproved", "approval-first", "mismatch", "duplicate", "duplicate-number", "foreign", "gap", "lock", "cap", "backlog", "verdict-first", "bad", "stray", "sweep"];
 const rank = (f: Finding) => { const i = RANK.indexOf(f.id.split(":")[0]); return i < 0 ? RANK.length : i; };
@@ -43,7 +54,7 @@ const isFinding = (f: unknown): f is Finding => typeof (f as Finding)?.id === "s
 
 /** Checks one stored record on its own: its envelope against its name and R2's upload time, then the writer's body. */
 export async function checkStored(seq: number, grant: string, stage: Stage, uploaded: Date, stored: string): Promise<{ finding?: Finding; env?: Envelope; job?: string; request?: string }> {
-  const bad = (why: string) => ({ finding: { id: `bad:${seq}`, text: `record ${seq} (${grant}/${stage}): ${why}` } });
+  const bad = (why: string) => ({ finding: { id: `bad:${seq}`, text: `record ${seq} (${fp(grant)}/${stage}): ${why}` } });
   let e: Envelope;
         try {
       e = JSON.parse(stored);
@@ -63,19 +74,32 @@ export async function checkStored(seq: number, grant: string, stage: Stage, uplo
 export function checkOrder(open: Record<string, Open>, grant: string, stage: Stage, job: string, request: string | undefined, sha: string, at: number): Finding | undefined {
   const g = Object.hasOwn(open, grant) ? open[grant] : undefined;
   if (stage === "request") {
-    if (g) return { id: `duplicate:${grant}:request`, text: `grant ${grant} has a second request record` };
+    if (g) return { id: `duplicate:${grant}:request`, text: `grant ${fp(grant)} has a second request record` };
     open[grant] = { job, req: sha, at, stages: ["request"] };
     return undefined;
   }
   if (!g) {
-    if (stage === "result") return { id: `unrecorded:${grant}`, text: `grant ${grant} has a result with no request record before it: something ran unrecorded` };
-    return { id: `${stage === "approval" ? "approval-first" : "verdict-first"}:${grant}`, text: `grant ${grant} has a${stage === "approval" ? "n approval" : " verdict"} with no request record before it` };
+    if (stage === "result") return { id: `unrecorded:${grant}`, text: `grant ${fp(grant)} has a result with no request record before it: something ran unrecorded` };
+    return { id: `${stage === "approval" ? "approval-first" : "verdict-first"}:${grant}`, text: `grant ${fp(grant)} has a${stage === "approval" ? "n approval" : " verdict"} with no request record before it` };
   }
-  if (g.stages.includes(stage)) return { id: `duplicate:${grant}:${stage}`, text: `grant ${grant} has a second ${stage} record` };
+  if (g.stages.includes(stage)) return { id: `duplicate:${grant}:${stage}`, text: `grant ${fp(grant)} has a second ${stage} record` };
   g.stages.push(stage);
-  if (request !== g.req || job !== g.job) return { id: `mismatch:${grant}`, text: `grant ${grant}: a later record names a different request or job than its request record` };
-  if (stage === "result" && !g.stages.includes("approval")) return { id: `unapproved:${grant}`, text: `grant ${grant} has a result with no approval record before it` };
+  if (request !== g.req || job !== g.job) return { id: `mismatch:${grant}`, text: `grant ${fp(grant)}: a later record names a different request or job than its request record` };
+  if (stage === "result" && !g.stages.includes("approval")) return { id: `unapproved:${grant}`, text: `grant ${fp(grant)} has a result with no approval record before it` };
   return undefined;
+}
+
+/** Every name under one record number's prefix, paged, up to MAX_NAMES_AT: record names and anything else. */
+async function namesAt(bucket: Pick<R2Bucket, "list">, prefix: string): Promise<{ cands: R2Object[]; junk: string[]; capped: boolean }> {
+  const cands: R2Object[] = [], junk: string[] = [];
+  let cursor: string | undefined, seen = 0;
+  do {
+    const page = await bucket.list({ prefix, cursor, limit: 1000 });
+    for (const o of page.objects) (KEY.test(o.key) ? cands.push(o) : junk.push(o.key));
+    seen += page.objects.length;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor && seen < MAX_NAMES_AT);
+  return { cands, junk: junk.slice(0, 20), capped: Boolean(cursor) };
 }
 
 /** Names outside records/v1/: the bucket's top level and records/ itself, one bounded page each. */
@@ -134,9 +158,14 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
       // (strays, planted high numbers) cost nothing and can never hide the records still to come.
       while (checked < PAGE) {
         const next = seq + 1, at = `${ROOT}${pad(next)}.`;
-        const page = await env.RECORDS.list({ prefix: at, limit: 3 });
-        const cands = page.objects.filter((o) => KEY.test(o.key));
-        for (const o of page.objects.filter((o) => !KEY.test(o.key))) findings.push(await stray(o.key));
+        const here = await namesAt(env.RECORDS, at);
+        for (const k of here.junk) findings.push(await stray(k));
+        if (here.capped) {
+          verdict = "unverified";
+          reason = `over ${MAX_NAMES_AT} names at record number ${next}: it could not be read`;
+          break;
+        }
+        const cands = here.cands;
         if (!cands.length) {
           // Nothing at the next number: the recorder has not written it yet. Anything right after
           // it is either a gap (a higher number without this one) or something outside the format.
@@ -147,8 +176,20 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
           break;
         }
         if (cands.length > 1) {
-          // Two objects share a number: the recorder wrote at most one. Neither is trusted or counted.
-          findings.push({ id: `duplicate-number:${next}`, text: `${cands.length} objects share record number ${next}: neither is trusted; something wrote around the recorder` });
+          // Objects share a number: the recorder wrote at most one. Each is checked on its own, none
+          // counts toward its grant's order, and the bookmark passes the number only once the next
+          // number exists -- proof the recorder has written its own -- so the real one is never skipped.
+          findings.push({ id: `duplicate-number:${next}`, text: `${cands.length} objects share record number ${next}: none is trusted; something wrote around the recorder` });
+          for (const o of cands) {
+            const m = KEY.exec(o.key)!;
+            const body = o.size > MAX_STORED_BYTES ? null : await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
+            const r = body === null ? undefined : await checkStored(next, m[2], m[3] as Stage, o.uploaded, body).catch(() => undefined);
+            if (r?.finding) findings.push({ ...r.finding, id: `${r.finding.id}:${m[2]}.${m[3]}` });
+            const d = day(o.uploaded);
+            days[d] = (days[d] ?? 0) + 1;
+          }
+          checked++;
+          if (!(await namesAt(env.RECORDS, `${ROOT}${pad(next + 1)}.`)).cands.length) break;
           seq = next;
           continue;
         }
@@ -156,7 +197,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
         const grant = m[2], stage = m[3] as Stage;
         try {
           if (o.size > MAX_STORED_BYTES) {
-            findings.push({ id: `bad:${next}`, text: `record ${next} (${grant}/${stage}): ${o.size} bytes, over ${MAX_STORED_BYTES}` });
+            findings.push({ id: `bad:${next}`, text: `record ${next} (${fp(grant)}/${stage}): ${o.size} bytes, over ${MAX_STORED_BYTES}` });
           } else {
             const body = await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
             if (body === null) {
@@ -173,7 +214,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
             }
           }
         } catch {
-          findings.push({ id: `bad:${next}`, text: `record ${next} (${grant}/${stage}): could not be checked` });
+          findings.push({ id: `bad:${next}`, text: `record ${next} (${fp(grant)}/${stage}): could not be checked` });
         }
         seq = next;
         const d = day(o.uploaded);
@@ -196,7 +237,8 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   for (const d of Object.keys(days)) if (d < day(new Date(now.getTime() - 3 * 86_400_000))) delete days[d];
 
   const lock = await readLockLength(env, fetchFn, now, RECORDS_BUCKET, LOCKED, MIN_LOCK_SECONDS);
-  if (lock.verdict === "short" || lock.verdict === "unverified") findings.push({ id: `lock:${lock.verdict}`, text: `records lock: ${lock.reason}` });
+  // No lock evidence is never healthy: until LOCK_READ_TOKEN is set, that is a standing finding.
+  if (lock.verdict !== "ok") findings.push({ id: `lock:${lock.verdict}`, text: "reason" in lock ? `records lock: ${lock.reason}` : "records lock not checked: LOCK_READ_TOKEN is not set yet" });
   if (findings.length && verdict === "healthy") verdict = "findings";
   if (verdict === "healthy") reason = `${checked} new records checked, all in order`;
   else if (verdict === "findings") reason = `${findings.length} finding${findings.length === 1 ? "" : "s"}: ${findings.map((f) => f.text).join("; ")}`;

@@ -26,6 +26,8 @@ or Ben) shows today's count and whether a write is pending. Nothing else answers
 | `request` | every stage but `request` | the SHA-256 (hex) of the request record's exact bytes, as in its receipt |
 | anything else | no | e.g. `params`, `requester`, `outcome` |
 
+The body is the exact bytes sent, UTF-8 with no byte-order mark (a leading mark is kept and then fails as not JSON).
+
 No secret values, ever, and no field at any depth whose name contains `secret`, `password`,
 `token`, `private` or `credential`, nested no deeper than 8 levels. The recorder refuses these;
 it cannot detect a secret under an innocent name, so the front desk redacts (phase 3).
@@ -40,7 +42,7 @@ it cannot detect a secret under an innocent name, so the front desk redacts (pha
 | 400 | outside the record format above (a fixed reason, never the writer's own text) |
 | 409 | approval or verdict with no recorded request; result with no recorded approval; wrong request hash or job; this stage already recorded with other content |
 | 410 | the grant's request is over 24 hours old |
-| 429 | today's 400 slots (UTC day) are taken. A request takes 4 slots: itself plus room for its grant's other three stages, so admitted grants can always finish. At most 100 grants a day; bytes are bounded by 400 x 8192 (3.2 MB a day). |
+| 429 | today's 400 slots (UTC day) are taken, or the lifetime storage budget (1 GiB of stored envelopes) is full. A request takes 4 slots and reserves room in the budget for its grant's other three stages, so admitted grants can always finish. A new day starts with the slots still reserved by grants opened the day before, never at zero, so no UTC day stores more than 400 records. A full budget refuses every request until Ben decides. |
 
 The same bytes sent again for a recorded stage get the same receipt (200), so a lost answer is
 safe to retry. A new record gets 201 and its receipt:
@@ -67,19 +69,23 @@ it accepted them. Each object holds an envelope, with the writer's bytes untouch
 
 ## What the Observatory checks every hour
 
-Every record stored since its last run, from a saved bookmark (at most 500 an hour; more is
-itself a finding): the name, the size, the envelope against the name and R2's upload time (within
+Every record stored since its last run, asking for the next expected number by name each time,
+so names elsewhere in the bucket cost nothing and cannot hide records still to come (at most 500
+an hour; more is itself a finding). Two objects with one number: each is checked, none counts for
+its grant, and the number is passed only once the next number exists. A missing number with a
+higher one present is a standing gap finding. For each record: the name, the size, the envelope against the name and R2's upload time (within
 10 minutes), the hash, the record against this contract, and the order of each grant's stages
 (no duplicates, request first, approval before result, same request and job). Also: any gap in
 the numbers, anything outside `records/v1/`, a UTC day over 400 records, and the lock on
 `records/` (once `LOCK_READ_TOKEN` exists). Once a day (04:30 UTC) it counts every record against
 the recorder's last number, which catches an object slipped in under an older name. Findings
-never repeat writer-chosen text; unexpected names are shown as a short fingerprint. Each finding
+never repeat writer-chosen text: grant ids and unexpected names are shown as short fingerprints.
+A lock it cannot read, including before `LOCK_READ_TOKEN` exists, is a finding, never healthy. Each finding
 alerts once, worst first; it counts as told only once a channel took the alert, and the rest are
 carried to the next hour. Until Ben sets `PING_URL_RECORDS`, it only logs.
 
 ## Choices for Ben to keep or change
 
-400 records a day (100 grants), 8192 bytes a record, 24 hours to finish a grant, and a 400-day
-lock are builder defaults (Codex r1 drift item), sized for the front desk's expected few
-approvals a day. Changing any of them is one constant in `src/contract.ts` or `src/records.ts`.
+400 records a day (100 grants), 8192 bytes a record, a 1 GiB lifetime storage budget, 24 hours
+to finish a grant, and a 400-day lock are builder defaults (Codex r1 drift item), sized for the front desk's expected few
+approvals a day. Changing any of them is one constant in `src/contract.ts` or `src/records.ts`. Before anything deletes old records after the lock, the daily count (records stored = last number) must change with it.

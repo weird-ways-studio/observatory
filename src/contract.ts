@@ -10,6 +10,11 @@ export const MAX_STORED_BYTES = MAX_RECORD_BYTES * 2 + 1_024; // the stored enve
 // to finish: at most 100 grants a day. Bytes are bounded by this cap times MAX_RECORD_BYTES (3.2 MB).
 export const DAY_CAP = 400;
 export const STAGE_SLOTS = 4;
+// Lifetime ceiling on stored envelopes (the lock keeps them at least 400 days; nothing deletes them
+// yet). A request also reserves room for its grant's stages. Full means every request is refused
+// until Ben decides: 1 GiB is about 60,000 records at the largest size, years at the day cap's
+// realistic use. The Durable Object's per-grant state grows with the records, so this bounds it too.
+export const STORE_BUDGET_BYTES = 1024 ** 3;
 export const GRANT_TTL_MS = 24 * 3_600_000; // later stages of a grant are refused after this
 export const SKEW_MS = 10 * 60_000; // the recorder's own time vs the time R2 stored the object
 export const STAGES = ["request", "approval", "verdict", "result"] as const;

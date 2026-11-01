@@ -4,7 +4,9 @@ import worker from "../src/index.ts";
 import { FRESH_CRON } from "../src/fresh.ts";
 import { DAY_CAP, keyFor, MAX_STORED_BYTES, sha256, type Stage } from "../src/contract.ts";
 import { Ledger, type Storage } from "../src/recorder/ledger.ts";
-import { MAX_QUEUED, MIN_LOCK_SECONDS, PAGE, runRecords, STATE_KEY, SWEEP_HOUR, type RecordsEnv } from "../src/records.ts";
+import { fp, MAX_QUEUED, MIN_LOCK_SECONDS, PAGE, runRecords, STATE_KEY, SWEEP_HOUR, type RecordsEnv } from "../src/records.ts";
+/** A finding line for a grant, as alerts show it: the fingerprint, never the id. */
+const says = (grant: string, rest: string) => new RegExp(`grant ${fp(grant)}${rest}`);
 
 const NOW = new Date("2026-11-01T12:30:00Z");
 const MIN = 60_000;
@@ -74,12 +76,13 @@ async function planted(b: B, seq: number, grant: string, stage: Stage, uploaded:
   b.add(keyFor(seq, grant, stage), JSON.stringify(env), uploaded);
 }
 
-function wire(lockRules?: object[], pushover = 200, hc = 200) {
+const GOOD_LOCK = [{ id: "r", enabled: true, prefix: "records/", condition: { type: "Age", maxAgeSeconds: MIN_LOCK_SECONDS } }];
+function wire(lockRules: object[] = GOOD_LOCK, pushover = 200, hc = 200) {
   const calls: { host: string; path: string; body: string }[] = [];
   const fetch = async (req: Request) => {
     const url = new URL(req.url);
     calls.push({ host: url.hostname, path: url.pathname, body: await req.text() });
-    if (url.hostname === "api.cloudflare.com") return Response.json({ success: true, result: { rules: lockRules ?? [] } });
+    if (url.hostname === "api.cloudflare.com") return Response.json({ success: true, result: { rules: lockRules } });
     if (url.hostname === "api.pushover.net") return new Response("{}", { status: pushover });
     return new Response("{}", { status: hc });
   };
@@ -92,6 +95,8 @@ const env = (records: B | undefined, over: Partial<Omit<RecordsEnv, "COPY">> = {
   PING_URL_RECORDS: "https://hc-records.example/rec",
   PUSHOVER_TOKEN: "a".repeat(30),
   PUSHOVER_USER: "b".repeat(30),
+  LOCK_READ_TOKEN: "t".repeat(40),
+  LOCK_ACCOUNT_ID: "f".repeat(32),
   ...over,
 });
 const ids = async (e: RecordsEnv & { COPY: B }) => JSON.parse(e.COPY.store.get(STATE_KEY)!.body).alerted as string[];
@@ -131,10 +136,10 @@ test("order: result with no request is 'ran unrecorded'; no approval; approval o
   await planted(b, 4, "grant-cccc", "approval", at(-2));
   await planted(b, 5, "grant-dddd", "verdict", at(-1));
   const why = await reasonOf(b);
-  assert.match(why, /grant grant-aaaa has a result with no request record before it: something ran unrecorded/);
-  assert.match(why, /grant grant-bbbb has a result with no approval record before it/);
-  assert.match(why, /grant grant-cccc has an approval with no request record before it/);
-  assert.match(why, /grant grant-dddd has a verdict with no request record before it/);
+  assert.match(why, says("grant-aaaa", " has a result with no request record before it: something ran unrecorded"));
+  assert.match(why, says("grant-bbbb", " has a result with no approval record before it"));
+  assert.match(why, says("grant-cccc", " has an approval with no request record before it"));
+  assert.match(why, says("grant-dddd", " has a verdict with no request record before it"));
 });
 
 test("r1 #3: a second stage for a grant is flagged, so a later duplicate cannot hide an earlier bad result", async () => {
@@ -144,15 +149,15 @@ test("r1 #3: a second stage for a grant is flagged, so a later duplicate cannot 
   await planted(b, 3, G, "approval", at(-3), { request: h });
   await planted(b, 4, G, "result", at(-2), { request: h });
   const why = await reasonOf(b);
-  assert.match(why, /grant grant-0001 has a result with no approval record before it/);
-  assert.match(why, /grant grant-0001 has a second result record/);
+  assert.match(why, says("grant-0001", " has a result with no approval record before it"));
+  assert.match(why, says("grant-0001", " has a second result record"));
 });
 
 test("a later record naming another request or job is a mismatch", async () => {
   const b = bucket();
   await planted(b, 1, G, "request", at(-5));
   await planted(b, 2, G, "approval", at(-4), { request: "f".repeat(64) });
-  assert.match(await reasonOf(b), /grant grant-0001: a later record names a different request or job than its request record/);
+  assert.match(await reasonOf(b), says("grant-0001", ": a later record names a different request or job than its request record"));
 });
 
 test("r1 #1 and r1 #8: names out of sequence are gaps; ties are impossible because order is the recorder's number", async () => {
@@ -204,9 +209,36 @@ test("security review: two objects with one number are both untrusted, counted f
   b.setClock(at(-8)); await l.accept(rec("approval", { request: h }), () => at(-8)); // the recorder's own number 2
   b.setClock(at(-7)); await l.accept(rec("verdict", { request: h }), () => at(-7)); // number 3
   const r = await runRecords(env(b), wire().fetch, NOW);
-  assert.match(r.reason, /2 objects share record number 2: neither is trusted/);
+  assert.match(r.reason, /2 objects share record number 2: none is trusted/);
   assert.equal(r.seq, 3);
-  assert.ok(!/grant-planted/.test(r.reason), "the planted record's grant was never applied");
+  assert.ok(!/grant-planted has/.test(r.reason), "the planted record's grant was never applied to the order check");
+});
+
+test("security review: a shared number is passed only once the next number exists, and every copy is checked", async () => {
+  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
+  const req = rec("request"), h = await sha256(req);
+  b.setClock(at(-10)); await l.accept(req, () => at(-10));
+  // Two objects planted at number 2 before the recorder gets there; one is broken.
+  await planted(b, 2, "grant-plant-a", "request", at(-9));
+  await planted(b, 2, "grant-plant-b", "request", at(-9), { envelope: { sha256: "0".repeat(64) } });
+  const first = await runRecords(e, wire().fetch, NOW);
+  assert.equal(first.seq, 1); // number 3 does not exist yet: stay, the recorder's own 2 may still come
+  assert.match(first.reason, /3 objects share|2 objects share record number 2/);
+  assert.match(first.reason, new RegExp(`record 2 \\(${fp("grant-plant-b")}/request\\): its body does not match its hash`));
+  b.setClock(at(1)); await l.accept(rec("approval", { request: h }), () => at(1)); // the recorder's 2
+  b.setClock(at(2)); await l.accept(rec("verdict", { request: h }), () => at(2)); // and 3
+  const second = await runRecords(e, wire().fetch, at(60));
+  assert.equal(second.seq, 3);
+  assert.match(second.reason, /3 objects share record number 2/);
+});
+
+test("security review: junk names under the next number cannot hide the real record there", async () => {
+  const b = bucket(), l = new Ledger(memory(), b);
+  for (const j of ["a", "aa", "aaa", "b"]) b.add(`records/v1/000000000001.${j}`, "{}", at(-11));
+  b.setClock(at(-10)); await l.accept(rec("request"), () => at(-10));
+  const r = await runRecords(env(b), wire().fetch, NOW);
+  assert.deepEqual([r.checked, r.seq], [1, 1]);
+  assert.match(r.reason, /something outside the record format/);
 });
 
 test("security review: a flood of junk names right after the bookmark cannot stall the reading of real records", async () => {
@@ -217,6 +249,15 @@ test("security review: a flood of junk names right after the bookmark cannot sta
   b.setClock(at(-8)); await l.accept(rec("approval", { request: h }), () => at(-8));
   const r = await runRecords(e, wire().fetch, NOW);
   assert.deepEqual([r.checked, r.seq], [2, 2]);
+});
+
+test("Codex r1 B8: grant ids never appear in alert text, only their fingerprints", async () => {
+  const b = bucket(), w = wire();
+  await planted(b, 1, "password_SENSITIVE_MARKER", "result", at(-1));
+  const r = await runRecords(env(b), w.fetch, NOW);
+  assert.ok(!r.reason.includes("SENSITIVE_MARKER"), r.reason);
+  assert.ok(!w.pushes().some((c) => c.body.includes("SENSITIVE_MARKER")));
+  assert.match(r.reason, says("password_SENSITIVE_MARKER", " has a result with no request record"));
 });
 
 test("security review: grant ids that are built-in object names cannot crash or corrupt the checker", async () => {
@@ -256,7 +297,7 @@ test("each broken stored record is flagged with a fixed reason", async () => {
   b.add(keyFor(++seq, "grant-json", "request"), "not json", at(0));
   const why = await reasonOf(b);
   for (const [, re] of cases) assert.match(why, re);
-  assert.match(why, /record 6 \(grant-json\/request\): not JSON/);
+  assert.match(why, new RegExp(`record 6 \\(${fp("grant-json")}/request\\): not JSON`));
   assert.ok(!why.includes("MARKER"));
 });
 
@@ -266,7 +307,7 @@ test("an oversized object is flagged by size and never downloaded", async () => 
   const get = b.get.bind(b);
   b.get = async (k: string) => { gets++; return get(k); };
   b.add(keyFor(1, G, "request"), "x", at(-1), MAX_STORED_BYTES + 1);
-  assert.match(await reasonOf(b), new RegExp(`record 1 \\(grant-0001/request\\): ${MAX_STORED_BYTES + 1} bytes`));
+  assert.match(await reasonOf(b), new RegExp(`record 1 \\(${fp("grant-0001")}/request\\): ${MAX_STORED_BYTES + 1} bytes`));
   assert.equal(gets, 0);
 });
 
@@ -376,7 +417,10 @@ test("the records lock is read and a short one is a finding; no key yet claims n
   assert.equal(short.lock, "short");
   const good = await runRecords(env(b, lockEnv), wire([{ id: "r", enabled: true, prefix: "records/", condition: { type: "Age", maxAgeSeconds: MIN_LOCK_SECONDS } }]).fetch, NOW);
   assert.equal(good.lock, "ok");
-  assert.equal((await runRecords(env(b), wire().fetch, NOW)).lock, "not set up");
+  // No lock key yet: never healthy, a standing finding instead.
+  const none = await runRecords(env(b, { LOCK_READ_TOKEN: undefined, LOCK_ACCOUNT_ID: undefined }), wire().fetch, NOW);
+  assert.deepEqual([none.lock, none.records], ["not set up", "findings"]);
+  assert.match(none.reason, /records lock not checked: LOCK_READ_TOKEN is not set yet/);
 });
 
 test("once a day the bucket is counted: an object written around the recorder below the bookmark is caught", async () => {
