@@ -33,7 +33,13 @@ export interface Stored { key: string; size: number; uploaded: Date }
 /** One finding: `id` is stable across hours so Ben hears about it once. */
 export interface Finding { id: string; text: string }
 
+const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
 const day = (d: Date) => d.toISOString().slice(0, 10);
+/** A writer-chosen name made safe to show Ben: safe characters only, and short. */
+export const shown = (name: string) => name.replace(/[^A-Za-z0-9/._-]/g, "?").slice(0, 60);
+// Worst first: what ran unrecorded or unchecked before what is merely malformed.
+const RANK = ["unrecorded", "unapproved", "approval-first", "lock", "cap", "late", "verdict-first", "bad", "stray"];
+const rank = (f: Finding) => { const i = RANK.indexOf(f.id.split(":")[0]); return i < 0 ? RANK.length : i; };
 
 /** Property names anywhere in `v` that look like they hold a secret. */
 function secretNames(v: unknown, out: string[] = []): string[] {
@@ -49,7 +55,7 @@ function secretNames(v: unknown, out: string[] = []): string[] {
 /** Checks one record on its own: its key, its size and its body against the R2 upload time. */
 export function checkRecord(obj: Stored, body: string | null): Finding[] {
   const m = KEY.exec(obj.key);
-  if (!m) return [{ id: `stray:${obj.key}`, text: `an object outside the record format: ${obj.key.slice(0, 120)}` }];
+  if (!m) return [{ id: `stray:${obj.key}`, text: `an object outside the record format: ${shown(obj.key)}` }];
   const [, date, grant, stage] = m;
   const bad = (why: string): Finding[] => [{ id: `bad:${obj.key}`, text: `record ${grant}/${stage}: ${why}` }];
   if (obj.size > MAX_RECORD_BYTES) return bad(`${obj.size} bytes, over ${MAX_RECORD_BYTES}`);
@@ -64,13 +70,13 @@ export function checkRecord(obj: Stored, body: string | null): Finding[] {
   if (r.v !== 1) return bad("not version 1");
   if (r.grant !== grant || r.stage !== stage) return bad("its body names a different grant or stage than its key");
   if (typeof r.job !== "string" || !JOB.test(r.job)) return bad("no valid job name");
-  const at = typeof r.at === "string" ? Date.parse(r.at) : NaN;
-  if (Number.isNaN(at)) return bad("no valid `at` time");
+  const at = typeof r.at === "string" && ISO.test(r.at) ? Date.parse(r.at) : NaN;
+  if (Number.isNaN(at)) return bad("no valid `at` time (UTC ISO, e.g. 2026-11-01T12:30:00Z)");
   // Ordering and dating rest on R2's upload time, which the writer cannot set.
-  if (Math.abs(at - obj.uploaded.getTime()) > SKEW_MS) return bad(`its time ${r.at} is more than 10 minutes from when it was stored`);
+  if (Math.abs(at - obj.uploaded.getTime()) > SKEW_MS) return bad(`its time ${new Date(at).toISOString()} is more than 10 minutes from when it was stored`);
   if (date !== day(new Date(at))) return bad(`filed under ${date} but dated ${day(new Date(at))}`);
   const names = secretNames(r);
-  if (names.length) return bad(`has fields named like secrets (${[...new Set(names)].slice(0, 5).join(", ")})`);
+  if (names.length) return bad(`has ${names.length} field${names.length === 1 ? "" : "s"} named like a secret`);
   return [];
 }
 
@@ -114,10 +120,42 @@ async function strays(bucket: Pick<R2Bucket, "list">): Promise<Finding[]> {
     let cursor: string | undefined;
     do {
       const page = await bucket.list({ prefix, delimiter: "/", cursor, limit: 1000 });
-      for (const p of page.delimitedPrefixes) if (p !== allowed) out.push({ id: `stray:${p}`, text: `a folder outside the record format: ${p.slice(0, 120)}` });
-      for (const o of page.objects) out.push({ id: `stray:${o.key}`, text: `an object outside the record format: ${o.key.slice(0, 120)}` });
+      for (const p of page.delimitedPrefixes) if (p !== allowed) out.push({ id: `stray:${p}`, text: `a folder outside the record format: ${shown(p)}` });
+      for (const o of page.objects) out.push({ id: `stray:${o.key}`, text: `an object outside the record format: ${shown(o.key)}` });
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
+  }
+  return out;
+}
+
+/** Day folders under records/v1/: each must be a real date, and none may be in the future. */
+async function dayFolders(bucket: Pick<R2Bucket, "list">, now: Date): Promise<Finding[]> {
+  const out: Finding[] = [], tomorrow = day(new Date(now.getTime() + SKEW_MS));
+  let cursor: string | undefined;
+  do {
+    const page = await bucket.list({ prefix: ROOT, delimiter: "/", cursor, limit: 1000 });
+    for (const p of page.delimitedPrefixes) {
+      const d = p.slice(ROOT.length, -1);
+      const t = /^\d{4}-\d{2}-\d{2}$/.test(d) ? Date.parse(`${d}T00:00:00Z`) : NaN;
+      const real = !Number.isNaN(t) && day(new Date(t)) === d; // 2026-02-30 parses, but to March
+      if (!real) out.push({ id: `stray:${p}`, text: `a folder outside the record format: ${shown(p)}` });
+      else if (d > tomorrow) out.push({ id: `late:${p}`, text: `records filed under a future day: ${shown(p)}` });
+    }
+    for (const o of page.objects) out.push({ id: `stray:${o.key}`, text: `an object outside the record format: ${shown(o.key)}` });
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return out;
+}
+
+export const SWEEP_HOUR = 4; // UTC: once a day every record is checked, not only the last two days
+/** Every record anywhere: one stored on a day other than its folder's was filed there after the fact. */
+async function sweep(bucket: Pick<R2Bucket, "list">): Promise<Finding[]> {
+  const out: Finding[] = [];
+  for (const o of await listAll(bucket, ROOT)) {
+    const m = KEY.exec(o.key);
+    if (!m) continue; // strays are reported by checkRecord and dayFolders
+    const t = o.uploaded.getTime(), ok = [day(new Date(t - SKEW_MS)), day(new Date(t + SKEW_MS))];
+    if (!ok.includes(m[1])) out.push({ id: `late:${o.key}`, text: `record ${m[2]}/${m[3]} was stored ${day(o.uploaded)} into the ${m[1]} folder` });
   }
   return out;
 }
@@ -153,7 +191,8 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
       for (const d of days) findings.push(...d.findings);
       const all = days.flatMap((d) => d.objs);
       checked = all.length;
-      findings.push(...checkOrder(all), ...(await strays(env.RECORDS)));
+      findings.push(...checkOrder(all), ...(await strays(env.RECORDS)), ...(await dayFolders(env.RECORDS, now)));
+      if (now.getUTCHours() === SWEEP_HOUR) findings.push(...(await sweep(env.RECORDS)));
     } catch {
       verdict = "unverified";
       reason = "the records could not be listed";
@@ -163,7 +202,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   if (lock.verdict === "short" || lock.verdict === "unverified") findings.push({ id: `lock:${lock.verdict}`, text: `records lock: ${lock.reason}` });
   if (findings.length && verdict === "healthy") verdict = "findings";
   if (verdict === "healthy") reason = `${checked} records checked, all in order`;
-  else if (verdict === "findings") reason = findings.map((f) => f.text).join("; ");
+  else if (verdict === "findings") reason = `${findings.length} finding${findings.length === 1 ? "" : "s"}: ${findings.map((f) => f.text).join("; ")}`;
 
   let prev: State = {};
   try {
@@ -171,15 +210,26 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
     if (saved) prev = JSON.parse(await saved.text());
   } catch { /* an unreadable state re-alerts at worst: safer than silence */ }
   const told = new Set(prev.alerted ?? []);
-  const fresh = findings.filter((f) => !told.has(f.id));
+  // A finding found twice (e.g. by the day and the folder checks) is one finding.
+  const unique = [...new Map(findings.map((f) => [f.id, f])).values()].sort((x, y) => rank(x) - rank(y));
+  const fresh = unique.filter((f) => !told.has(f.id));
   const ping = env.PING_URL_RECORDS;
 
   // Until Ben creates this job's check, it only logs (like fresh.ts): no alert, nothing that claims healthy.
   let via: string | undefined;
   if (ping && (fresh.length || (verdict === "unverified" && !told.has("unverified")))) {
-    const text = fresh.length ? fresh.map((f) => f.text).join("\n") : reason;
-    via = await alert({ ...env, PING_URL: ping }, fetchFn, "Observatory: the records need you", text);
-    for (const f of fresh) told.add(f.id);
+    // An alert holds 1024 characters: only the findings that fit count as told; the rest go next hour.
+    const sent: Finding[] = [];
+    let text = "";
+    for (const f of fresh) {
+      const line = `${f.text}\n`;
+      if (text.length + line.length > 900 && sent.length) break;
+      text += line.slice(0, 900);
+      sent.push(f);
+    }
+    if (sent.length < fresh.length) text += `(+${fresh.length - sent.length} more, sent next hour)`;
+    via = await alert({ ...env, PING_URL: ping }, fetchFn, "Observatory: the records need you", fresh.length ? text : reason);
+    for (const f of sent) told.add(f.id);
     if (verdict === "unverified") told.add("unverified");
   }
   if (verdict !== "unverified") told.delete("unverified");

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.ts";
 import { FRESH_CRON } from "../src/fresh.ts";
-import { checkOrder, checkRecord, DAY_CAP, MAX_RECORD_BYTES, MIN_LOCK_SECONDS, runRecords, STATE_KEY, type RecordsEnv, type Stored } from "../src/records.ts";
+import { checkOrder, checkRecord, DAY_CAP, MAX_RECORD_BYTES, MIN_LOCK_SECONDS, runRecords, shown, STATE_KEY, SWEEP_HOUR, type RecordsEnv, type Stored } from "../src/records.ts";
 
 const NOW = new Date("2026-11-01T12:30:00Z");
 const MIN = 60_000;
@@ -126,7 +126,8 @@ test("each broken body is flagged with its reason", () => {
     [body("request", NOW, {}, "grant-9999"), /different grant or stage/],
     [body("request", NOW, { job: "Bad Job" }), /no valid job name/],
     [body("request", NOW, { at: "yesterday" }), /no valid `at`/],
-    [body("request", NOW, { params: { api_token: "x" } }), /named like secrets \(api_token\)/],
+    [body("request", NOW, { params: { api_token: "x" } }), /has 1 field named like a secret$/],
+    [body("request", NOW, { at: "November 1, 2026 12:30" }), /no valid `at`/],
   ];
   for (const [b, why] of cases) assert.match(checkRecord(stored(key("request")), b)[0]?.text ?? "none", why, b);
 });
@@ -230,4 +231,49 @@ test("the hourly cron runs the records check as its own job", async () => {
   }
   assert.equal(jobs.length, 2);
   assert.ok(w.calls.some((c) => c.host === "hc-records.example"));
+});
+
+test("what the writer chose is never echoed raw: secret names, its time, odd characters in names", () => {
+  const f = checkRecord(stored(key("request")), body("request", NOW, { params: { "sk_live_ABC123token": "x" } }));
+  assert.doesNotMatch(f[0].text, /sk_live/);
+  const late = checkRecord(stored(key("request"), NOW), body("request", at(-30)));
+  assert.match(late[0].text, /2026-11-01T12:00:00\.000Z/);
+  assert.equal(shown("a b\nc<script>".repeat(10)).length, 60);
+  assert.match(shown("x y\n"), /^x\?y\?$/);
+});
+
+test("folders that are not a real date, or are in the future, are flagged every hour", async () => {
+  const b = bucket(), w = wire();
+  b.add(key("request", G, "2099-01-01"), body("request", NOW), NOW);
+  b.add("records/v1/2026-13-45/grant-0001/request.json", "{}", NOW);
+  const r = await runRecords(env(b), w.fetch, NOW);
+  assert.match(r.reason, /future day: records\/v1\/2099-01-01\//);
+  assert.match(r.reason, /folder outside the record format: records\/v1\/2026-13-45\//);
+});
+
+test("once a day every record is swept: one stored today into an old folder is caught", async () => {
+  const b = bucket(), w = wire(), sweepTime = new Date(`2026-11-01T0${SWEEP_HOUR}:30:00Z`);
+  b.add(key("result", G, "2026-10-20"), body("result", new Date("2026-10-20T12:00:00Z")), sweepTime);
+  b.add(key("request", "grant-0002", "2026-10-20"), body("request", new Date("2026-10-20T12:00:00Z"), {}, "grant-0002"), new Date("2026-10-20T12:00:00Z"));
+  const quiet = await runRecords(env(b), w.fetch, new Date("2026-11-01T12:30:00Z"));
+  assert.equal(quiet.records, "healthy", "outside the sweep hour, old folders are not listed");
+  const r = await runRecords(env(b), w.fetch, sweepTime);
+  assert.match(r.reason, /grant-0001\/result was stored 2026-11-01 into the 2026-10-20 folder/);
+  assert.doesNotMatch(r.reason, /grant-0002/);
+});
+
+test("an alert holds what fits, worst first; the rest are told next hour", async () => {
+  const b = bucket(), copy = bucket(), w = wire();
+  for (let i = 0; i < 30; i++) b.add(`stray-${String(i).padStart(2, "0")}-${"x".repeat(40)}`, "x", NOW);
+  b.add(key("result"), body("result", NOW), NOW);
+  const e = env(b, { COPY: copy });
+  await runRecords(e, w.fetch, NOW);
+  const first = new URLSearchParams(w.pushes()[0].body).get("message")!;
+  assert.match(first.split("\n")[0], /ran unrecorded/);
+  assert.match(first, /\(\+\d+ more, sent next hour\)/);
+  const told1 = JSON.parse(copy.store.get(STATE_KEY)!.body).alerted.length;
+  assert.ok(told1 < 31);
+  for (let h = 0; h < 5; h++) await runRecords(e, w.fetch, NOW);
+  assert.equal(JSON.parse(copy.store.get(STATE_KEY)!.body).alerted.length, 31);
+  assert.doesNotMatch(new URLSearchParams(w.pushes().at(-1)!.body).get("message")!, /more, sent next hour/);
 });

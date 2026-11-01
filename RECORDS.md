@@ -29,7 +29,7 @@ JSON object, at most 8192 bytes:
 | `v` | yes | `1` |
 | `grant` | yes | same as the key |
 | `stage` | yes | same as the key |
-| `at` | yes | ISO time the broker wrote it; must be within 10 minutes of when R2 stored it |
+| `at` | yes | UTC ISO time the broker wrote it, e.g. `2026-11-01T12:30:00Z` (milliseconds optional); within 10 minutes of when R2 stored it |
 | `job` | yes | the job name, e.g. `cf.token.canary` (`a-z 0-9 . -`, up to 40) |
 | anything else | no | e.g. `params`, `requester`, `hash`, `outcome` |
 
@@ -55,6 +55,10 @@ R2's own upload time decides order; the writer cannot set it.
 ## What the Observatory checks every hour
 
 Today's and yesterday's folders: each key, size, body and time; the order above; at most 400 records
-a day; anything outside `records/v1/`; and the lock on `records/` (once `LOCK_READ_TOKEN` exists).
-Each finding alerts once; it alerts again only if it clears and comes back. Until Ben sets
-`PING_URL_RECORDS`, it only logs.
+a day; anything outside `records/v1/`; any day folder that is not a real date or is in the future;
+and the lock on `records/` (once `LOCK_READ_TOKEN` exists). Once a day (04:30 UTC) it also sweeps
+every record and flags any stored on a day other than its folder's (filed into an old day after the
+fact). Alerts show the worst findings first and never repeat writer-chosen text raw (field names
+are counted, times re-printed, names cleaned); a finding counts as told only if it fit in the alert,
+the rest follow the next hour. Each finding alerts once; again only if it clears and comes back.
+Until Ben sets `PING_URL_RECORDS`, it only logs.
