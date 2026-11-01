@@ -172,12 +172,12 @@ test("security review: a planted name past every record never parks the bookmark
   const first = await runRecords(e, wire().fetch, NOW);
   assert.equal(first.checked, 1);
   // The stray sorts after the jump, so this hour stops before it; the jump alerts and the daily count covers both.
-  assert.match(first.reason, /record numbers jumped from 1 to 999999999999: reading stops there/);
+  assert.match(first.reason, /record numbers jumped from 1 to 999999999999: number 2 is missing/);
   // The next real records, numbered 2 and 3, are read on the next hour despite the planted names.
   for (const [s, m] of [["approval", 1], ["result", 2]] as const) { b.setClock(at(m)); await l.accept(rec(s, { request: h }), () => at(m)); }
   const second = await runRecords(e, wire().fetch, at(60));
   assert.deepEqual([second.checked, second.seq], [2, 3]);
-  assert.match(second.reason, /reading stops there/); // still reported while it stays
+  assert.match(second.reason, /jumped from 3 to 999999999999/); // still reported while it stays
 });
 
 test("security review: a stray name that sorts after every record is reported each hour and never hides new records", async () => {
@@ -196,6 +196,29 @@ test("security review: a stray name that sorts after every record is reported ea
   assert.match(second.reason, /something outside the record format/);
 });
 
+test("security review: two objects with one number are both untrusted, counted for neither grant, and reading goes on", async () => {
+  const b = bucket(), l = new Ledger(memory(), b);
+  const req = rec("request"), h = await sha256(req);
+  b.setClock(at(-10)); await l.accept(req, () => at(-10));
+  await planted(b, 2, "grant-planted", "approval", at(-9)); // takes number 2 before the recorder does
+  b.setClock(at(-8)); await l.accept(rec("approval", { request: h }), () => at(-8)); // the recorder's own number 2
+  b.setClock(at(-7)); await l.accept(rec("verdict", { request: h }), () => at(-7)); // number 3
+  const r = await runRecords(env(b), wire().fetch, NOW);
+  assert.match(r.reason, /2 objects share record number 2: neither is trusted/);
+  assert.equal(r.seq, 3);
+  assert.ok(!/grant-planted/.test(r.reason), "the planted record's grant was never applied");
+});
+
+test("security review: a flood of junk names right after the bookmark cannot stall the reading of real records", async () => {
+  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
+  const req = rec("request"), h = await sha256(req);
+  b.setClock(at(-10)); await l.accept(req, () => at(-10));
+  for (let i = 0; i < PAGE + 100; i++) b.add(`records/v1/000000000001~junk${String(i).padStart(4, "0")}`, "{}", at(-9));
+  b.setClock(at(-8)); await l.accept(rec("approval", { request: h }), () => at(-8));
+  const r = await runRecords(e, wire().fetch, NOW);
+  assert.deepEqual([r.checked, r.seq], [2, 2]);
+});
+
 test("security review: grant ids that are built-in object names cannot crash or corrupt the checker", async () => {
   const b = bucket();
   await viaRecorder(b, ["constructor", "hasOwnProperty"]);
@@ -210,9 +233,14 @@ test("anything not named by the recorder is a stray, anywhere in the bucket, and
   b.add("records/v1/zzz-password_MARKER", "{}", at(-1));
   b.add("records/other/x", "{}", at(-1));
   b.add("loose_SECRET_NAME", "{}", at(-1));
+  // Hourly: the name right after the next expected number, and everything outside records/v1/.
   const why = await reasonOf(b);
-  assert.equal((why.match(/something outside the record format, fingerprint [0-9a-f]{12}/g) ?? []).length, 4);
+  assert.equal((why.match(/something outside the record format, fingerprint [0-9a-f]{12}/g) ?? []).length, 3);
   assert.ok(!/MARKER|SECRET_NAME|2026-10-29|other/.test(why), why);
+  // Daily: every name under records/v1/ is counted, so the one deeper in is caught too.
+  const daily = await reasonOf(b, new Date("2026-11-02T04:30:00Z"));
+  assert.match(daily, /the bucket holds 6 records but the recorder numbered 4/);
+  assert.ok(!/MARKER/.test(daily));
 });
 
 test("each broken stored record is flagged with a fixed reason", async () => {
@@ -247,7 +275,7 @@ test("r1 #6: work per hour is bounded; a flood beyond a page is flagged and read
   for (let i = 1; i <= PAGE + 3; i++) await planted(b, i, `grant-${String(i).padStart(5, "0")}`, "request", at(-1));
   const first = await runRecords(e, wire().fetch, NOW);
   assert.equal(first.checked, PAGE);
-  assert.match(first.reason, new RegExp(`more than ${PAGE} new records in an hour`));
+  assert.match(first.reason, new RegExp(`${PAGE} new records in an hour`));
   assert.match(first.reason, new RegExp(`${PAGE} records stored on 2026-11-01, over the cap of ${DAY_CAP}`));
   assert.equal((await runRecords(e, wire().fetch, at(60))).checked, 3);
 });

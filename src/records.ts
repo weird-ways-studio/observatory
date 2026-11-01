@@ -18,7 +18,7 @@ export const RECORDS_BUCKET = "observatory-records"; // the RECORDS binding's bu
 export const LOCKED = "records/";
 export const MIN_LOCK_SECONDS = 400 * 86_400; // over a year of history, then lifecycle may delete
 export const STATE_KEY = "state/records.json";
-export const PAGE = 500; // records read an hour: more than the recorder can take in a day's cap
+export const PAGE = 500; // records read an hour (one list and one read each): more than the recorder can take in a day
 export const SWEEP_HOUR = 4; // UTC: once a day every name in the bucket is counted
 export const SWEEP_PAGES = 200; // up to 200,000 records counted; beyond that the sweep says so
 export const MAX_OPEN = 2_000; // grants remembered for the order check
@@ -28,14 +28,16 @@ export const MAX_QUEUED = 200; // findings not yet delivered, carried hour to ho
 /** One finding: `id` is stable across hours so Ben hears about it once. Text never holds writer-chosen words. */
 export interface Finding { id: string; text: string }
 interface Open { job: string; req: string; at: number; stages: Stage[] }
-interface State { cursor?: string; seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
+interface State { seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
 
 const day = (d: Date) => d.toISOString().slice(0, 10);
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 /** A short fingerprint for a name we must not repeat: enough for Ben (or an agent) to find it. */
 const tag = async (name: string) => (await sha256(name)).slice(0, 12);
+const stray = async (name: string): Promise<Finding> => { const t = await tag(name); return { id: `stray:${t}`, text: `something outside the record format, fingerprint ${t}` }; };
+const pad = (n: number) => String(n).padStart(12, "0");
 // Worst first: what ran unrecorded or unchecked before what is merely malformed.
-const RANK = ["unrecorded", "unapproved", "approval-first", "mismatch", "duplicate", "foreign", "gap", "lock", "cap", "backlog", "verdict-first", "bad", "stray", "sweep"];
+const RANK = ["unrecorded", "unapproved", "approval-first", "mismatch", "duplicate", "duplicate-number", "foreign", "gap", "lock", "cap", "backlog", "verdict-first", "bad", "stray", "sweep"];
 const rank = (f: Finding) => { const i = RANK.indexOf(f.id.split(":")[0]); return i < 0 ? RANK.length : i; };
 const isFinding = (f: unknown): f is Finding => typeof (f as Finding)?.id === "string" && typeof (f as Finding)?.text === "string";
 
@@ -117,7 +119,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // No prototype: a grant id can never reach a built-in object property.
   const open: Record<string, Open> = Object.assign(Object.create(null), prev.open && typeof prev.open === "object" ? prev.open : {});
   const days: Record<string, number> = Object.assign(Object.create(null), prev.days && typeof prev.days === "object" ? prev.days : {});
-  let cursor = typeof prev.cursor === "string" ? prev.cursor : undefined, seq = Number.isInteger(prev.seq) ? prev.seq! : 0;
+  let seq = Number.isInteger(prev.seq) ? prev.seq! : 0; // the last record number checked: the bookmark
   let swept = Array.isArray(prev.swept) ? prev.swept.filter(isFinding).slice(0, MAX_SWEPT) : [];
   // A record is read once, so a finding not yet delivered is carried until it is.
   const findings: Finding[] = Array.isArray(prev.queued) ? prev.queued.filter(isFinding).slice(0, MAX_QUEUED) : [];
@@ -128,54 +130,57 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
     reason = "no RECORDS binding";
   } else {
     try {
-      const page = await env.RECORDS.list({ prefix: ROOT, startAfter: cursor, limit: PAGE });
-      for (const o of page.objects) {
-        const m = KEY.exec(o.key);
-        // The bookmark moves only to the next expected number, so no planted name can park it
-        // past the records still to come: a stray is reported every hour it stays in view, and a
-        // jump in the numbers stops the read there until it is resolved.
-        if (!m) {
-          const t = await tag(o.key);
-          findings.push({ id: `stray:${t}`, text: `something outside the record format, fingerprint ${t}` });
-          continue;
-        }
-        const n = Number(m[1]), grant = m[2], stage = m[3] as Stage;
-        if (n <= seq) {
-          findings.push({ id: `gap:${n}:repeat`, text: `record number ${n} appeared after ${seq}: a name the recorder already used` });
-          continue;
-        }
-        if (n > seq + 1) {
-          findings.push({ id: `gap:${n}`, text: `record numbers jumped from ${seq} to ${n}: reading stops there until it is resolved` });
+      // Each step asks for the next expected number by name, so names elsewhere in the bucket
+      // (strays, planted high numbers) cost nothing and can never hide the records still to come.
+      while (checked < PAGE) {
+        const next = seq + 1, at = `${ROOT}${pad(next)}.`;
+        const page = await env.RECORDS.list({ prefix: at, limit: 3 });
+        const cands = page.objects.filter((o) => KEY.test(o.key));
+        for (const o of page.objects.filter((o) => !KEY.test(o.key))) findings.push(await stray(o.key));
+        if (!cands.length) {
+          // Nothing at the next number: the recorder has not written it yet. Anything right after
+          // it is either a gap (a higher number without this one) or something outside the format.
+          const after = (await env.RECORDS.list({ prefix: ROOT, startAfter: at, limit: 1 })).objects[0];
+          const am = after && KEY.exec(after.key);
+          if (after && !am) findings.push(await stray(after.key));
+          else if (am) findings.push({ id: `gap:${Number(am[1])}`, text: `record numbers jumped from ${seq} to ${Number(am[1])}: number ${next} is missing` });
           break;
         }
+        if (cands.length > 1) {
+          // Two objects share a number: the recorder wrote at most one. Neither is trusted or counted.
+          findings.push({ id: `duplicate-number:${next}`, text: `${cands.length} objects share record number ${next}: neither is trusted; something wrote around the recorder` });
+          seq = next;
+          continue;
+        }
+        const o = cands[0], m = KEY.exec(o.key)!;
+        const grant = m[2], stage = m[3] as Stage;
         try {
-        if (o.size > MAX_STORED_BYTES) {
-          findings.push({ id: `bad:${n}`, text: `record ${n} (${grant}/${stage}): ${o.size} bytes, over ${MAX_STORED_BYTES}` });
-        } else {
-          const body = await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
-          if (body === null) {
-            // Stop here and read it again next hour: the bookmark never passes a record not checked.
-            verdict = "unverified";
-            reason = `record ${n} could not be read`;
-            break;
+          if (o.size > MAX_STORED_BYTES) {
+            findings.push({ id: `bad:${next}`, text: `record ${next} (${grant}/${stage}): ${o.size} bytes, over ${MAX_STORED_BYTES}` });
+          } else {
+            const body = await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
+            if (body === null) {
+              // Stop here and read it again next hour: the bookmark never passes a record not checked.
+              verdict = "unverified";
+              reason = `record ${next} could not be read`;
+              break;
+            }
+            const r = await checkStored(next, grant, stage, o.uploaded, body);
+            if (r.finding) findings.push(r.finding);
+            else {
+              const f = checkOrder(open, grant, stage, r.job!, r.request, r.env!.sha256, o.uploaded.getTime());
+              if (f) findings.push(f);
+            }
           }
-          const r = await checkStored(n, grant, stage, o.uploaded, body);
-          if (r.finding) findings.push(r.finding);
-          else {
-            const f = checkOrder(open, grant, stage, r.job!, r.request, r.env!.sha256, o.uploaded.getTime());
-            if (f) findings.push(f);
-          }
-        }
         } catch {
-          findings.push({ id: `bad:${n}`, text: `record ${n} (${grant}/${stage}): could not be checked` });
+          findings.push({ id: `bad:${next}`, text: `record ${next} (${grant}/${stage}): could not be checked` });
         }
-        seq = n;
+        seq = next;
         const d = day(o.uploaded);
         days[d] = (days[d] ?? 0) + 1;
-        cursor = o.key;
         checked++;
       }
-      if (page.truncated && verdict === "healthy") findings.push({ id: `backlog:${day(now)}`, text: `more than ${PAGE} new records in an hour, over what the recorder can take: the rest are read next hour` });
+      if (checked === PAGE && verdict === "healthy") findings.push({ id: `backlog:${day(now)}`, text: `${PAGE} new records in an hour, over what the recorder can take: the rest are read next hour` });
       findings.push(...(await strays(env.RECORDS)));
       if (now.getUTCHours() === SWEEP_HOUR) swept = await sweep(env.RECORDS, seq);
     } catch {
@@ -228,7 +233,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // Keep only what is still found, so a finding that comes back is told again.
   const still = new Set([...findings.map((f) => f.id), ...(verdict === "unverified" ? ["unverified"] : [])]);
   try {
-    await env.COPY.put(STATE_KEY, JSON.stringify({ cursor, seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
+    await env.COPY.put(STATE_KEY, JSON.stringify({ seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
   } catch {
     reason = `records state could not be saved; ${reason}`;
     verdict = "unverified";
