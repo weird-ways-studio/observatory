@@ -2,7 +2,8 @@
 // No address at all -- no workers.dev, no preview URLs, no routes -- so nothing reaches it.
 // Phase 2c (card 202ac367): a nightly cron and one binding, the locked copy bucket.
 // Card f0d4e2fc adds an hourly cron at :30 for src/fresh.ts; src/index.ts routes each cron by name.
-// 11:00 UTC is after the c-box backup (03:10 CT) and push (04:32 CT) in both CDT and CST.
+// 03:50 UTC is 9:50 pm CST (10:50 pm CDT), so alerts reach Ben in the evening (Ben, 2026-11-01). It copies
+// that Chicago day's backup (made 03:10 CT, pushed 04:32 CT), the folder backupDate in src/copy.ts names.
 // Secrets (set in the dashboard, never here): SOURCE_ACCESS_KEY_ID, SOURCE_SECRET_ACCESS_KEY,
 // SOURCE_ENDPOINT, SOURCE_BUCKET, PING_URL, and for phase 2b alerts (card 9a6ed286)
 // PUSHOVER_TOKEN, PUSHOVER_USER, for the hourly freshness check (card f0d4e2fc) PING_URL_FRESH,
@@ -17,7 +18,7 @@
   "workers_dev": false,
   "preview_urls": false,
   "send_metrics": false,
-  "triggers": { "crons": ["0 11 * * *", "30 * * * *"] },
+  "triggers": { "crons": ["50 3 * * *", "30 * * * *"] },
   "r2_buckets": [{ "binding": "COPY", "bucket_name": "observatory-backups" }],
   "observability": { "enabled": true }
 }
