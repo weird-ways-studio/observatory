@@ -1,0 +1,23 @@
+// The recorder Worker (card feea07eb, route A), deployed with `wrangler deploy -c wrangler.recorder.jsonc`.
+// Separate from the backup Worker (wrangler.jsonc), which keeps no address at all.
+// Its one address is its workers.dev URL, behind Cloudflare Access (door 2 of
+// instruction.app-exposure-doors; Ben chose this route 2026-11-01, task 56d8dd39). The Worker also
+// checks the Access token itself (src/recorder/access.ts). No preview URLs, no routes.
+// It reaches only RECORDS (observatory-records, locked add-only) and its own Durable Object LEDGER,
+// a SQLite-backed one (free plan; over-limit operations fail, they are never billed).
+// Settings (set in the dashboard, never here): ACCESS_TEAM, ACCESS_AUD, ACCESS_SERVICE_ID,
+// ACCESS_BEN_EMAIL. Without all four it refuses every request.
+// test/recorder-config.test.ts fails if any of that changes; widen it only in a reviewed PR.
+// Comments here stay on their own lines: the test reads this file as JSON after dropping them.
+{
+  "name": "observatory-recorder",
+  "main": "src/recorder/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "send_metrics": false,
+  "r2_buckets": [{ "binding": "RECORDS", "bucket_name": "observatory-records" }],
+  "durable_objects": { "bindings": [{ "name": "LEDGER", "class_name": "Recorder" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Recorder"] }],
+  "observability": { "enabled": true }
+}

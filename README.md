@@ -2,7 +2,7 @@
 
 The studio's independent check on its agents. It will record every request agents make through the Front Desk before it runs, read what the providers say changed, and alert Ben on anything that does not match. Only code Ben approved ever runs here.
 
-Today it does two jobs: a second, locked copy of the studio's nightly backups (phase 2c), and an hourly check that what runs here is what is on `main` (card f0d4e2fc).
+Today it does three jobs: a second, locked copy of the studio's nightly backups (phase 2c), an hourly check that what runs here is what is on `main` (card f0d4e2fc), and an hourly check of the front desk's add-only records (phase 2a, card feea07eb). A second Worker, the recorder, takes those records in (below).
 
 ## Nightly backup copy (phase 2c, card 202ac367)
 
@@ -15,6 +15,12 @@ At 03:15 UTC, 9:15 pm Chicago time in winter (`triggers` in `wrangler.jsonc`), `
 5. Pings the dead-man check "up" only if every step passed; otherwise it reports a failure, so Ben gets an email. A missed night also emails him.
 
 The copy bucket's lock rules keep each night for 30 days (D2, Ben 2026-10-31; the canary forever); a lifecycle rule then removes it. Lock rules win over lifecycle rules, and the Worker's own code cannot delete a locked object. One log line per night records counts, bytes, total stored bytes, the canary result and the lock-length verdict.
+
+## The recorder and the hourly records check (phase 2a, card feea07eb, route A)
+
+The front desk records each grant's request, verdict, approval and result **before** it acts; the format is in `RECORDS.md`. It sends each record to the **recorder**, a separate Worker (`src/recorder/`, deployed from `wrangler.recorder.jsonc`) that reaches only the `observatory-records` bucket and its own Durable Object, never the backups. The recorder refuses, before storing anything, a record outside the contract, a stage out of order for its grant, a later stage that does not name its request's exact bytes, or a request when the day's 400 slots are taken or the 1 GiB lifetime storage budget is full (each request reserves its grant's other three stages, and those reservations carry into the next day). It takes records one at a time, names each with a gap-free sequence number and its own time, saves it as pending, writes it to the bucket, and only then answers with a receipt. A lock rule on `records/` makes the bucket add-only.
+
+At :30 past every hour, as a job separate from the freshness check, `src/records.ts` re-reads every record stored since its last run, asking for each next record number by name, against the same contract (`src/contract.ts`), and reports anything the recorder should have refused or that something else wrote: a gap in the numbers, a duplicate or out-of-order stage, a broken envelope or body, an object outside the record format, more than a day's cap, and a lock on `records/` shorter than 400 days. Once a day (04:30 UTC) it counts every record against the recorder's numbering. Findings never repeat writer-chosen text (grant ids and stray names appear as fingerprints), and a lock it cannot read, including before `LOCK_READ_TOKEN` exists, is a finding. Each finding alerts once through Pushover, falling back to this job's own check (`PING_URL_RECORDS`); a finding counts as told only if a channel took the alert, and the rest are carried to the next hour. State lives at `state/records.json` in the copy bucket. A record number shared by several objects is held and re-checked every hour, and the run stays unverified until Ben names the copy he trusts in the `RECORDS_HELD_ACK` setting (`<number>:<grant>.<stage>`). Until `PING_URL_RECORDS` is set it only logs. It reads; it never writes to the records bucket.
 
 ## Hourly freshness check (card f0d4e2fc)
 
@@ -34,14 +40,19 @@ Limit: it runs inside the thing it checks. That counts only after cutover, when 
 - **Its own home (moved 2026-10-31, card 3e2f8870):** this repo lives in its own GitHub org, `weird-ways-observatory`, owned by `benculbert` and `weird-ways`, which refuses all personal access tokens, so no agent credential can reach it (proof 5.7.4: agent writes refused). Agents propose changes from a fork, `weird-ways-studio/observatory-proposals`, and send Ben a compare link (see `CLAUDE.md`). The rest of the cutover (revoking the construction keys, new secrets, proofs) is still open on that card.
 - **What deploys:** Cloudflare **Workers Builds** in the Observatory's own Cloudflare account builds `main` and deploys it; its trigger includes only `main`, because a branch build would run code nobody reviewed with the build's deploy rights. A merge starts the build by itself (proven 2026-11-01, PR #10; root-cause card c19f4946).
 - **Who holds keys:** no agent holds any Observatory credential, except two temporary keys Ben approved for phase 2c setup (one for R2 and Workers scripts, one for reading and starting builds), both expiring 2026-11-13. Agents change the code only by opening pull requests.
-- **Address (studio app-exposure doors):** none. `wrangler.jsonc` turns off workers.dev and preview URLs and has no routes, so the Worker is unreachable from any network, which is stricter than the tailnet-only door. Endpoints added in later phases go behind an edge login (door 2). `test/config.test.ts` fails if the address, bindings or schedules change.
-- **Entry point:** `src/index.ts` (`main` in `wrangler.jsonc`); Cloudflare calls its default export's `scheduled` on each cron and `fetch` only if an address were ever added.
+- **Address (studio app-exposure doors), backup Worker:** none. `wrangler.jsonc` turns off workers.dev and preview URLs and has no routes, so the Worker is unreachable from any network, which is stricter than the tailnet-only door. `test/config.test.ts` fails if the address, bindings or schedules change.
+- **Address, recorder Worker: door 2** (edge login in front of the whole Worker). Its one address is its workers.dev URL, behind Cloudflare Access, which admits only the front desk's service token and Ben. Why not door 1: the front desk runs on Cloudflare, not on the tailnet, so it cannot reach a tailnet-only address. Ben chose this route on 2026-11-01 (Brain task 56d8dd39, after a cross-model review). The Worker also checks Access's signed token itself (`src/recorder/access.ts`: signature, issuer, audience, expiry, identity) and refuses everything while its settings are missing, so a wrong Access setting alone never opens it. Answers carry `X-Robots-Tag: noindex`. `test/recorder-config.test.ts` fails if its address or bindings change.
+- **Entry points:** `src/index.ts` (`main` in `wrangler.jsonc`); Cloudflare calls its default export's `scheduled` on each cron and `fetch` only if an address were ever added. The recorder: `src/recorder/index.ts` (`main` in `wrangler.recorder.jsonc`); Cloudflare calls `fetch` for each request (`src/recorder/http.ts` routes it) and runs the `Recorder` Durable Object class, named in the config's `durable_objects` binding, as one instance named "v1".
 
 ## Known limits
 
 - Until the studio's temporary access ends on 2026-11-13 (revocation plan, epic cafd3acc), agents hold keys that can edit org rulesets, the main backup bucket's settings, and this account. So neither this protection nor the backup copy is independent of the agents yet; independence is claimed only after those keys are proven refused.
 - The copy faithfully copies whatever the source holds. If tonight's source were overwritten with garbage, earlier nights stay locked here for 30 days; spotting the tampering is a later phase.
 - Cloudflare's own GitHub app (Workers and Pages) holds administration write on the repos it is installed on. Cloudflare controls it; no studio agent can drive it.
+
+- The recorder is not live until Ben's end-of-build sitting: Zero Trust on this account, the Access app and service token, the records bucket and its lock, and a Workers Builds connection for `wrangler.recorder.jsonc`. Live refusal proofs follow (anonymous call refused, service token admitted, overwrite refused by the lock).
+- The recorder and the front desk agree on order, not on truth: a tampered front-desk deploy could skip recording. Phase 3 makes the front desk refuse to run without a receipt; Ben's review of `main` remains the control.
+- The service token's identity is read from the token's `common_name` claim (FROM MEMORY of Access's service-token tokens; the sitting's live proof confirms it).
 
 ## Develop
 
