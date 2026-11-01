@@ -179,7 +179,7 @@ test("a finding alerts once, stays quiet while it lasts, and alerts again if it 
   assert.deepEqual(w.hc(), ["/rec/fail", "/rec/fail"]); // bad every hour, told once
   b.store.clear();
   await runRecords(e, w.fetch, NOW);
-  assert.deepEqual(JSON.parse(copy.store.get(STATE_KEY)!.body), { alerted: [] });
+  assert.deepEqual(JSON.parse(copy.store.get(STATE_KEY)!.body), { alerted: [], swept: [] });
   b.add(key("result"), body("result", NOW), NOW);
   await runRecords(e, w.fetch, NOW);
   assert.equal(w.pushes().length, 2);
@@ -276,4 +276,19 @@ test("an alert holds what fits, worst first; the rest are told next hour", async
   for (let h = 0; h < 5; h++) await runRecords(e, w.fetch, NOW);
   assert.equal(JSON.parse(copy.store.get(STATE_KEY)!.body).alerted.length, 31);
   assert.doesNotMatch(new URLSearchParams(w.pushes().at(-1)!.body).get("message")!, /more, sent next hour/);
+});
+
+test("sweep findings that did not fit at 04:30 are carried and told in the next hours", async () => {
+  const b = bucket(), copy = bucket(), w = wire(), sweepTime = new Date(`2026-11-01T0${SWEEP_HOUR}:30:00Z`);
+  for (let i = 0; i < 30; i++) {
+    const g = `grant-${String(i).padStart(4, "0")}`;
+    b.add(key("request", g, "2026-10-20"), body("request", new Date("2026-10-20T12:00:00Z"), {}, g), sweepTime);
+  }
+  const e = env(b, { COPY: copy });
+  await runRecords(e, w.fetch, sweepTime);
+  assert.ok(JSON.parse(copy.store.get(STATE_KEY)!.body).alerted.length < 30);
+  for (let h = 1; h <= 5; h++) await runRecords(e, w.fetch, new Date(sweepTime.getTime() + h * 3_600_000));
+  const state = JSON.parse(copy.store.get(STATE_KEY)!.body);
+  assert.equal(state.alerted.length, 30);
+  assert.equal(state.swept.length, 30);
 });

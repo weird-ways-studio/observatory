@@ -174,10 +174,20 @@ async function checkDay(bucket: Pick<R2Bucket, "list" | "get">, date: string): P
 }
 
 export type RecordsVerdict = "healthy" | "findings" | "unverified";
-interface State { alerted?: string[] }
+// `swept` carries the daily sweep's findings through every hour until the next sweep, so a finding
+// that did not fit in the 04:30 alert is still found, and told, in the hours after.
+interface State { alerted?: string[]; swept?: Finding[] }
+export const MAX_SWEPT = 200;
+const isFinding = (f: unknown): f is Finding => typeof (f as Finding)?.id === "string" && typeof (f as Finding)?.text === "string";
 
 /** One hour's run: read, judge, alert once per new finding, keep state, then ping this job's own check. */
 export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Promise<Response>, now: Date) {
+  let prev: State = {};
+  try {
+    const saved = await env.COPY.get(STATE_KEY);
+    if (saved) prev = JSON.parse(await saved.text());
+  } catch { /* an unreadable state re-alerts at worst: safer than silence */ }
+  let swept = Array.isArray(prev.swept) ? prev.swept.filter(isFinding).slice(0, MAX_SWEPT + 1) : [];
   const findings: Finding[] = [];
   let verdict: RecordsVerdict = "healthy", reason = "";
   let checked = 0;
@@ -192,23 +202,23 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
       const all = days.flatMap((d) => d.objs);
       checked = all.length;
       findings.push(...checkOrder(all), ...(await strays(env.RECORDS)), ...(await dayFolders(env.RECORDS, now)));
-      if (now.getUTCHours() === SWEEP_HOUR) findings.push(...(await sweep(env.RECORDS)));
+      if (now.getUTCHours() === SWEEP_HOUR) {
+        const all = await sweep(env.RECORDS);
+        swept = all.slice(0, MAX_SWEPT);
+        if (all.length > MAX_SWEPT) swept.push({ id: "late:more", text: `${all.length - MAX_SWEPT} more records filed into other days` });
+      }
     } catch {
       verdict = "unverified";
       reason = "the records could not be listed";
     }
   }
+  findings.push(...swept);
   const lock = await readLockLength(env, fetchFn, now, RECORDS_BUCKET, LOCKED, MIN_LOCK_SECONDS);
   if (lock.verdict === "short" || lock.verdict === "unverified") findings.push({ id: `lock:${lock.verdict}`, text: `records lock: ${lock.reason}` });
   if (findings.length && verdict === "healthy") verdict = "findings";
   if (verdict === "healthy") reason = `${checked} records checked, all in order`;
   else if (verdict === "findings") reason = `${findings.length} finding${findings.length === 1 ? "" : "s"}: ${findings.map((f) => f.text).join("; ")}`;
 
-  let prev: State = {};
-  try {
-    const saved = await env.COPY.get(STATE_KEY);
-    if (saved) prev = JSON.parse(await saved.text());
-  } catch { /* an unreadable state re-alerts at worst: safer than silence */ }
   const told = new Set(prev.alerted ?? []);
   // A finding found twice (e.g. by the day and the folder checks) is one finding.
   const unique = [...new Map(findings.map((f) => [f.id, f])).values()].sort((x, y) => rank(x) - rank(y));
@@ -236,7 +246,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // Keep only what is still found, so a finding that comes back is told again.
   const still = new Set([...findings.map((f) => f.id), ...(verdict === "unverified" ? ["unverified"] : [])]);
   try {
-    await env.COPY.put(STATE_KEY, JSON.stringify({ alerted: [...told].filter((id) => still.has(id)) }));
+    await env.COPY.put(STATE_KEY, JSON.stringify({ alerted: [...told].filter((id) => still.has(id)), swept }));
   } catch {
     reason = `records state could not be saved; ${reason}`;
     verdict = "unverified";
