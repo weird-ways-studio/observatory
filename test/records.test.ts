@@ -253,6 +253,25 @@ test("Codex r3: clearing a hold days later still counts its day against the cap"
   assert.match(r.reason, new RegExp(`${DAY_CAP + 1} records stored on 2026-11-01, over the cap of ${DAY_CAP}`));
 });
 
+test("Codex r4: a replay longer than one hour's page keeps its bookkeeping until it catches up", async () => {
+  // Request #1, held approval #2 (two copies), 499 other requests, then the grant's result at #502.
+  const b = bucket(), e = env(b), req = rec("request"), h = await sha256(req), t0 = new Date("2026-11-01T10:00:00Z");
+  await planted(b, 1, G, "request", t0);
+  await planted(b, 2, G, "approval", t0, { request: h });
+  await planted(b, 2, "grant-plant-q", "request", t0);
+  for (let n = 3; n <= 501; n++) await planted(b, n, `grant-f${String(n).padStart(4, "0")}`, "request", n <= 401 ? t0 : new Date("2026-11-02T10:00:00Z"));
+  await planted(b, 502, G, "result", new Date("2026-11-02T10:00:00Z"), { request: h });
+  for (const hr of [0, 1]) await runRecords(e, wire().fetch, new Date(`2026-11-02T1${hr}:30:00Z`)); // read through, #2 held
+  // Cleared days later: the replay takes two hours' pages and must not forget the request or Nov 1's count.
+  const ack = { ...e, RECORDS_HELD_ACK: "2:grant-0001.approval" };
+  const one = await runRecords(ack, wire().fetch, new Date("2026-11-06T10:30:00Z"));
+  const two = await runRecords(ack, wire().fetch, new Date("2026-11-06T11:30:00Z"));
+  assert.equal(two.seq, 502);
+  const all = `${one.reason}; ${two.reason}`;
+  assert.ok(!/result with no request record/.test(all), all);
+  assert.match(all, new RegExp(`401 records stored on 2026-11-01, over the cap of ${DAY_CAP}`));
+});
+
 test("security review: junk names under a number cannot hide its real record, and at most 20 numbers are held", async () => {
   const b = bucket(), l = new Ledger(memory(), b);
   b.setClock(at(-10)); await l.accept(rec("request"), () => at(-10));

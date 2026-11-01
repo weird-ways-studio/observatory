@@ -32,7 +32,7 @@ export const MAX_QUEUED = 200; // findings not yet delivered, carried hour to ho
 export interface Finding { id: string; text: string }
 interface Open { job: string; req: string; at: number; stages: Stage[] }
 interface Snap { seq: number; open: Record<string, Open>; days: Record<string, number> }
-interface State { snap?: Snap; held?: number[]; seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
+interface State { snap?: Snap; replayTo?: number; held?: number[]; seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
 
 const day = (d: Date) => d.toISOString().slice(0, 10);
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -161,6 +161,8 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   const held = new Set((Array.isArray(prev.held) ? prev.held : []).filter((n) => Number.isInteger(n)));
   // Taken just before the first held number: the bookkeeping to rewind to once Ben names a copy.
   let snap: Snap | undefined = prev.snap && Number.isInteger(prev.snap.seq) ? prev.snap : undefined;
+  // While a rewind is being re-read, nothing is tidied away until the bookmark is back where it was.
+  let replayTo = Number.isInteger(prev.replayTo) ? prev.replayTo! : 0;
   // For each held number, the copy Ben trusts ("42:<grant>.<stage>"), from a setting only he sets.
   const trusted = new Map<number, string>();
   for (const part of (env.RECORDS_HELD_ACK ?? "").split(",")) {
@@ -171,6 +173,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
     // Ben named the copy at the earliest held number: rewind to just before it and read on from
     // there in order, his copy standing as that number's record, so order and day counts come out
     // exactly as if it had been the only one. Later shared numbers are met again on the way.
+    replayTo = Math.max(replayTo, seq);
     ({ seq } = snap);
     open = bare<Open>(snap.open);
     days = bare<number>(snap.days);
@@ -288,10 +291,14 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   }
   for (const [d, n] of Object.entries(days)) if (n > DAY_CAP) findings.push({ id: `cap:${d}`, text: `${n} records stored on ${d}, over the cap of ${DAY_CAP}` });
   findings.push(...swept);
-  // Forget grants past their life, keeping at most MAX_OPEN, and day counts older than three days.
-  for (const [g, o] of Object.entries(open)) if (now.getTime() - o.at > GRANT_TTL_MS + 86_400_000) delete open[g];
-  for (const g of Object.keys(open).sort((a, b) => open[a].at - open[b].at).slice(0, Math.max(0, Object.keys(open).length - MAX_OPEN))) delete open[g];
-  for (const d of Object.keys(days)) if (d < day(new Date(now.getTime() - 3 * 86_400_000))) delete days[d];
+  // Forget grants past their life, keeping at most MAX_OPEN, and day counts older than three days --
+  // but not while a rewind is still being re-read: that bookkeeping is what the replay checks against.
+  if (replayTo && seq >= replayTo) replayTo = 0;
+  if (!replayTo) {
+    for (const [g, o] of Object.entries(open)) if (now.getTime() - o.at > GRANT_TTL_MS + 86_400_000) delete open[g];
+    for (const g of Object.keys(open).sort((a, b) => open[a].at - open[b].at).slice(0, Math.max(0, Object.keys(open).length - MAX_OPEN))) delete open[g];
+    for (const d of Object.keys(days)) if (d < day(new Date(now.getTime() - 3 * 86_400_000))) delete days[d];
+  }
 
   const lock = await readLockLength(env, fetchFn, now, RECORDS_BUCKET, LOCKED, MIN_LOCK_SECONDS);
   // No lock evidence is never healthy: until LOCK_READ_TOKEN is set, that is a standing finding.
@@ -332,7 +339,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // Keep only what is still found, so a finding that comes back is told again.
   const still = new Set([...findings.map((f) => f.id), ...(verdict === "unverified" ? ["unverified"] : [])]);
   try {
-    await env.COPY.put(STATE_KEY, JSON.stringify({ snap, held: [...held], seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
+    await env.COPY.put(STATE_KEY, JSON.stringify({ snap, replayTo, held: [...held], seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
   } catch {
     reason = `records state could not be saved; ${reason}`;
     verdict = "unverified";

@@ -78,7 +78,8 @@ checked whenever it lands; none counts toward a grant or a day; and the run stay
 Ben names the copy he trusts in the `RECORDS_HELD_ACK` setting, as `<number>:<grant>.<stage>`
 (comma-separated), earliest held number first. The checker then rewinds to just before that number
 (it saved its bookkeeping there) and reads on in order with Ben's copy as that number's record, so
-the order and day checks come out as if it had been the only one. At most 20 numbers are held; the
+the order and day checks come out as if it had been the only one (nothing is tidied away until the
+replay is back where it was). At most 20 numbers are held; the
 21st stops the read, unverified. A missing number with a
 higher one present is a standing gap finding. For each record: the name, the size, the envelope against the name and R2's upload time (within
 10 minutes), the hash, the record against this contract, and the order of each grant's stages
