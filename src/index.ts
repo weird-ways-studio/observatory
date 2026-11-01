@@ -7,7 +7,7 @@ import { runNight, type Env } from "./copy.ts";
 import { deliveryTest } from "./alert.ts";
 import { FRESH_CRON, runFresh, type FreshEnv } from "./fresh.ts";
 
-export const NIGHT_CRON = "0 11 * * *";
+export const NIGHT_CRON = "50 3 * * *";
 
 /** Wraps a body of known size so R2 accepts it as a stream (R2 needs the length up front). */
 function sized(body: ReadableStream, size: number): ReadableStream {
