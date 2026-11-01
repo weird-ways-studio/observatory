@@ -31,7 +31,8 @@ export const MAX_QUEUED = 200; // findings not yet delivered, carried hour to ho
 /** One finding: `id` is stable across hours so Ben hears about it once. Text never holds writer-chosen words. */
 export interface Finding { id: string; text: string }
 interface Open { job: string; req: string; at: number; stages: Stage[] }
-interface State { held?: number[]; seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
+interface Snap { seq: number; open: Record<string, Open>; days: Record<string, number> }
+interface State { snap?: Snap; held?: number[]; seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
 
 const day = (d: Date) => d.toISOString().slice(0, 10);
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -101,6 +102,19 @@ async function namesAt(bucket: Pick<R2Bucket, "list">, prefix: string): Promise<
   return { cands, junk: junk.slice(0, 20), capped: Boolean(cursor) };
 }
 
+/** Each copy at a shared number checked on its own (findings only; none counts toward a grant or a day). */
+async function checkCopies(bucket: Pick<R2Bucket, "get">, n: number, copies: R2Object[]): Promise<Finding[]> {
+  const out: Finding[] = [];
+  for (const o of copies) {
+    const m = KEY.exec(o.key)!, grant = m[2], stage = m[3] as Stage;
+    const body = o.size > MAX_STORED_BYTES ? null : await bucket.get(o.key).then((b) => (b ? b.text() : null), () => null);
+    const r = body === null ? undefined : await checkStored(n, grant, stage, o.uploaded, body).catch(() => undefined);
+    if (!r) out.push({ id: `bad:${n}:${grant}.${stage}`, text: `record ${n} (${await fp(grant)}/${stage}): too large or could not be read` });
+    else if (r.finding) out.push({ ...r.finding, id: `${r.finding.id}:${grant}.${stage}` });
+  }
+  return out;
+}
+
 /** Names outside records/v1/: the bucket's top level and records/ itself, one bounded page each. */
 async function strays(bucket: Pick<R2Bucket, "list">): Promise<Finding[]> {
   const out: Finding[] = [];
@@ -140,10 +154,29 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
     if (saved) prev = JSON.parse(await saved.text());
   } catch { /* an unreadable state re-reads from the start and re-alerts at worst: safer than silence */ }
   // No prototype: a grant id can never reach a built-in object property.
-  const open: Record<string, Open> = Object.assign(Object.create(null), prev.open && typeof prev.open === "object" ? prev.open : {});
-  const days: Record<string, number> = Object.assign(Object.create(null), prev.days && typeof prev.days === "object" ? prev.days : {});
+  const bare = <T>(o: unknown): Record<string, T> => Object.assign(Object.create(null), o && typeof o === "object" ? o : {});
+  let open = bare<Open>(prev.open);
+  let days = bare<number>(prev.days);
   let seq = Number.isInteger(prev.seq) ? prev.seq! : 0; // the last record number checked: the bookmark
   const held = new Set((Array.isArray(prev.held) ? prev.held : []).filter((n) => Number.isInteger(n)));
+  // Taken just before the first held number: the bookkeeping to rewind to once Ben names a copy.
+  let snap: Snap | undefined = prev.snap && Number.isInteger(prev.snap.seq) ? prev.snap : undefined;
+  // For each held number, the copy Ben trusts ("42:<grant>.<stage>"), from a setting only he sets.
+  const trusted = new Map<number, string>();
+  for (const part of (env.RECORDS_HELD_ACK ?? "").split(",")) {
+    const m = /^\s*(\d{1,12}):([A-Za-z0-9][A-Za-z0-9_-]{7,63}\.(?:request|approval|verdict|result))\s*$/.exec(part);
+    if (m) trusted.set(Number(m[1]), m[2]);
+  }
+  if (held.size && snap && trusted.has(Math.min(...held))) {
+    // Ben named the copy at the earliest held number: rewind to just before it and read on from
+    // there in order, his copy standing as that number's record, so order and day counts come out
+    // exactly as if it had been the only one. Later shared numbers are met again on the way.
+    ({ seq } = snap);
+    open = bare<Open>(snap.open);
+    days = bare<number>(snap.days);
+    held.clear();
+    snap = undefined;
+  }
   let swept = Array.isArray(prev.swept) ? prev.swept.filter(isFinding).slice(0, MAX_SWEPT) : [];
   // A record is read once, so a finding not yet delivered is carried until it is.
   const findings: Finding[] = Array.isArray(prev.queued) ? prev.queued.filter(isFinding).slice(0, MAX_QUEUED) : [];
@@ -175,22 +208,31 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
           else if (am) findings.push({ id: `gap:${Number(am[1])}`, text: `record numbers jumped from ${seq} to ${Number(am[1])}: number ${next} is missing` });
           break;
         }
+        let o = cands[0];
         if (cands.length > 1) {
           // Objects share a number: the recorder wrote at most one, and the checker cannot tell which
-          // (it cannot read the recorder's ledger, by design). The number is held: its copies are
-          // checked now and every hour after (so the recorder's own is checked whenever it lands),
-          // none counts toward a grant or a day, and reading goes on past it.
-          if (held.size >= MAX_HELD) {
-            verdict = "unverified";
-            reason = `${MAX_HELD} record numbers are already held: reading stopped at ${next} until Ben clears some`;
-            break;
+          // (it cannot read the recorder's ledger, by design). Every copy is checked; unless Ben has
+          // named the one he trusts, the number is held (re-checked every hour, counted toward
+          // nothing) and reading goes on past it.
+          findings.push({ id: `duplicate-number:${next}`, text: `${cands.length} objects share record number ${next}: none is trusted; something wrote around the recorder` });
+          const pick = trusted.get(next);
+          const chosen = cands.find((c) => { const k = KEY.exec(c.key)!; return pick === `${k[2]}.${k[3]}`; });
+          findings.push(...(await checkCopies(env.RECORDS, next, cands.filter((c) => c !== chosen))));
+          if (chosen) o = chosen;
+          else {
+            if (held.size >= MAX_HELD) {
+              verdict = "unverified";
+              reason = `${MAX_HELD} record numbers are already held: reading stopped at ${next} until Ben clears some`;
+              break;
+            }
+            if (!held.size) snap = { seq, open: JSON.parse(JSON.stringify(open)), days: { ...days } };
+            held.add(next);
+            seq = next;
+            checked++;
+            continue;
           }
-          held.add(next);
-          seq = next;
-          checked++;
-          continue;
         }
-        const o = cands[0], m = KEY.exec(o.key)!;
+        const m = KEY.exec(o.key)!;
         const grant = m[2], stage = m[3] as Stage;
         const shown = await fp(grant);
         try {
@@ -220,13 +262,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
         checked++;
       }
       if (checked === PAGE && verdict === "healthy") findings.push({ id: `backlog:${day(now)}`, text: `${PAGE} new records in an hour, over what the recorder can take: the rest are read next hour` });
-      // Held numbers: every copy re-checked each hour; the run stays unverified until Ben clears each
-      // by naming the copy he trusts ("42:<grant>.<stage>"), which then joins the order and day checks.
-      const trusted = new Map<number, string>();
-      for (const part of (env.RECORDS_HELD_ACK ?? "").split(",")) {
-        const m = /^\s*(\d{1,12}):([A-Za-z0-9][A-Za-z0-9_-]{7,63}\.(?:request|approval|verdict|result))\s*$/.exec(part);
-        if (m) trusted.set(Number(m[1]), m[2]);
-      }
+      // Held numbers: every copy re-checked each hour, so the recorder's own is checked whenever it lands.
       for (const n of [...held].sort((a, b) => a - b)) {
         const here = await namesAt(env.RECORDS, `${ROOT}${pad(n)}.`);
         for (const k of here.junk) findings.push(await stray(k));
@@ -235,29 +271,12 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
           reason = `over ${MAX_NAMES_AT} names at held record number ${n}: it could not be read`;
           continue;
         }
-        const pick = trusted.get(n);
-        let cleared = false;
-        for (const o of here.cands) {
-          const m = KEY.exec(o.key)!, grant = m[2], stage = m[3] as Stage, mine = pick === `${grant}.${stage}`;
-          const body = o.size > MAX_STORED_BYTES ? null : await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
-          const r = body === null ? undefined : await checkStored(n, grant, stage, o.uploaded, body).catch(() => undefined);
-          if (!r) findings.push({ id: `bad:${n}:${grant}.${stage}`, text: `record ${n} (${await fp(grant)}/${stage}): too large or could not be read` });
-          else if (r.finding) findings.push({ ...r.finding, id: `${r.finding.id}:${grant}.${stage}` });
-          else if (mine) {
-            // The copy Ben trusts joins the order and day checks, then the hold ends.
-            const f = checkOrder(open, grant, stage, r.job!, r.request, r.env!.sha256, o.uploaded.getTime(), n, await fp(grant));
-            if (f) findings.push(f);
-            const d = day(o.uploaded);
-            days[d] = (days[d] ?? 0) + 1;
-            cleared = true;
-          }
-        }
-        if (cleared) held.delete(n);
-        else findings.push({ id: `duplicate-number:${n}`, text: `${here.cands.length} objects share record number ${n}: none is trusted; something wrote around the recorder` });
+        findings.push({ id: `duplicate-number:${n}`, text: `${here.cands.length} objects share record number ${n}: none is trusted; something wrote around the recorder` });
+        findings.push(...(await checkCopies(env.RECORDS, n, here.cands)));
       }
       if (held.size) {
         verdict = "unverified";
-        const heldWhy = `record number${held.size === 1 ? "" : "s"} ${[...held].sort((a, b) => a - b).slice(0, MAX_HELD).join(", ")}${held.size > MAX_HELD ? " and more" : ""} held (shared by several objects): reading goes on, but the run stays unverified until Ben names the copy he trusts in RECORDS_HELD_ACK`;
+        const heldWhy = `record number${held.size === 1 ? "" : "s"} ${[...held].sort((a, b) => a - b).slice(0, MAX_HELD).join(", ")}${held.size > MAX_HELD ? " and more" : ""} held (shared by several objects): reading goes on, but the run stays unverified until Ben names the copy he trusts in RECORDS_HELD_ACK, earliest number first`;
         reason = reason ? `${reason}; ${heldWhy}` : heldWhy;
       }
       findings.push(...(await strays(env.RECORDS)));
@@ -313,7 +332,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // Keep only what is still found, so a finding that comes back is told again.
   const still = new Set([...findings.map((f) => f.id), ...(verdict === "unverified" ? ["unverified"] : [])]);
   try {
-    await env.COPY.put(STATE_KEY, JSON.stringify({ held: [...held], seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
+    await env.COPY.put(STATE_KEY, JSON.stringify({ snap, held: [...held], seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
   } catch {
     reason = `records state could not be saved; ${reason}`;
     verdict = "unverified";

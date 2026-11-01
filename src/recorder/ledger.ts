@@ -134,9 +134,9 @@ export class Ledger {
         // Stored before a crash: fine only if its raw bytes are ours.
         if ((await sha256(new Uint8Array(await there.arrayBuffer()))) !== p.storedSha) return "the next record's name is taken by an object the recorder did not write: Ben must look";
       } else {
-        if (now.getTime() - Date.parse(p.receipt.recorded_at) > SKEW_MS / 2) {
-          // Stored late (the bucket was down): no receipt has gone out, so it takes the time it is
-          // actually stored, and its receipt says the same.
+        if (now.getTime() - Date.parse(p.receipt.recorded_at) > SKEW_MS / 2 || day(now.getTime()) !== p.day) {
+          // Stored late (the bucket was down), or on a later UTC day however briefly: no receipt has
+          // gone out, so it takes the time it is actually stored, and its receipt says the same.
           const receipt = { ...p.receipt, recorded_at: now.toISOString() };
           const stored = JSON.stringify({ ...(JSON.parse(p.stored) as Envelope), recorded_at: receipt.recorded_at });
           const g = (await this.storage.get<Grant>(`g:${receipt.grant}`))!;

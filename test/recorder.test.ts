@@ -243,7 +243,8 @@ test("Codex r1: after a long outage the record takes the time it is stored, and 
 
 test("Codex r2: a write held over midnight by an outage is charged to the day it is stored; no day exceeds the cap", async () => {
   const st = storage(), b = bucket(), l = new Ledger(st, b);
-  const eve = () => new Date("2026-11-01T23:59:00Z"), morn = () => new Date("2026-11-02T00:30:00Z");
+  // A short outage: 23:59:30 to 00:01, under the 5-minute re-stamp threshold (Codex r3).
+  const eve = () => new Date("2026-11-01T23:59:30Z"), morn = () => new Date("2026-11-02T00:01:00Z");
   // 100 grants finished before midnight (399 records), the last result held by an outage.
   for (let i = 0; i < DAY_CAP / STAGE_SLOTS; i++) {
     const g = `grant-e${String(i).padStart(4, "0")}`, r = rec("request", {}, g), h = await sha256(r);
@@ -254,14 +255,18 @@ test("Codex r2: a write held over midnight by an outage is charged to the day it
     }
   }
   // After midnight: 100 new grants try to run in full; the held result is stored first.
+  const storedBefore = b.store.size; // everything put from here on lands on 2026-11-02
   for (let i = 0; i < DAY_CAP / STAGE_SLOTS; i++) {
     const g = `grant-m${String(i).padStart(4, "0")}`, r = rec("request", {}, g), h = await sha256(r);
     if ((await l.accept(r, morn)).status !== 201) continue;
     for (const stg of ["approval", "verdict", "result"]) await l.accept(rec(stg, { request: h }, g), morn);
   }
-  const nov2 = [...b.store.values()].filter((v) => (JSON.parse(v.body) as Envelope).recorded_at.startsWith("2026-11-02")).length;
+  const nov2 = b.store.size - storedBefore;
   assert.ok(nov2 <= DAY_CAP, `${nov2} records stored on 2026-11-02`);
   assert.ok((await l.status(morn())).used_today <= DAY_CAP);
+  // And the held record carries the day it was actually stored.
+  const held = [...b.store.values()].map((v) => JSON.parse(v.body) as Envelope).find((v) => v.grant === "grant-e0099" && v.stage === "result")!;
+  assert.ok(held.recorded_at.startsWith("2026-11-02"), held.recorded_at);
 });
 
 test("Codex r2: recovery compares the stored object's raw bytes, not its decoded text", async () => {

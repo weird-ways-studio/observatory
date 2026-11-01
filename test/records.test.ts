@@ -230,6 +230,29 @@ test("security review: a shared number is held -- reading goes on, every copy is
   assert.equal(Object.values(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).days as Record<string, number>).reduce((x, y) => x + y, 0), 3);
 });
 
+test("Codex r3: a cleared held copy is checked in its place in the order, not after later records", async () => {
+  const b = bucket(), e = env(b), req = rec("request"), h = await sha256(req);
+  await planted(b, 1, G, "request", at(-10));
+  await planted(b, 2, G, "result", at(-9), { request: h }); // the result, before any approval
+  await planted(b, 2, "grant-plant-z", "request", at(-9));
+  await planted(b, 3, G, "approval", at(-8), { request: h });
+  assert.equal((await runRecords(e, wire().fetch, NOW)).records, "unverified");
+  const r = await runRecords({ ...e, RECORDS_HELD_ACK: "2:grant-0001.result" }, wire().fetch, at(60));
+  assert.notEqual(r.records, "healthy");
+  assert.match(r.reason, await says(G, " has a result with no approval record before it", "2"));
+});
+
+test("Codex r3: clearing a hold days later still counts its day against the cap", async () => {
+  const b = bucket(), e = env(b), nov1 = new Date("2026-11-01T10:00:00Z");
+  for (let n = 1; n <= DAY_CAP; n++) await planted(b, n, `grant-d${String(n).padStart(4, "0")}`, "request", nov1);
+  await planted(b, DAY_CAP + 1, "grant-held-a", "request", nov1);
+  await planted(b, DAY_CAP + 1, "grant-held-b", "request", nov1);
+  await runRecords(e, wire().fetch, new Date("2026-11-01T12:30:00Z"));
+  await runRecords(e, wire().fetch, new Date("2026-11-05T12:30:00Z")); // the Nov 1 day count is pruned by now
+  const r = await runRecords({ ...e, RECORDS_HELD_ACK: `${DAY_CAP + 1}:grant-held-a.request` }, wire().fetch, new Date("2026-11-05T13:30:00Z"));
+  assert.match(r.reason, new RegExp(`${DAY_CAP + 1} records stored on 2026-11-01, over the cap of ${DAY_CAP}`));
+});
+
 test("security review: junk names under a number cannot hide its real record, and at most 20 numbers are held", async () => {
   const b = bucket(), l = new Ledger(memory(), b);
   b.setClock(at(-10)); await l.accept(rec("request"), () => at(-10));
