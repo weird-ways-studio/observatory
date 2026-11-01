@@ -12,6 +12,7 @@ export interface RecordsEnv extends AlertEnv, LockEnv {
   RECORDS?: Pick<R2Bucket, "list" | "get">; // read and list only: this job never writes there
   COPY: Pick<R2Bucket, "get" | "put">; // state/records.json lives in the copy bucket's unlocked state/
   PING_URL_RECORDS?: string; // this job's own healthchecks check; Ben creates it at the end of the build
+  RECORDS_HELD_ACK?: string; // record numbers Ben has looked at, e.g. "42,97": held numbers he clears (a setting only he sets)
 }
 
 export const RECORDS_BUCKET = "observatory-records"; // the RECORDS binding's bucket (wrangler.jsonc)
@@ -24,12 +25,13 @@ export const SWEEP_PAGES = 200; // up to 200,000 records counted; beyond that th
 export const MAX_OPEN = 2_000; // grants remembered for the order check
 export const MAX_SWEPT = 50;
 export const MAX_NAMES_AT = 1_000; // names listed under one record number before the hour gives up as unverified
+export const MAX_HELD = 20; // shared record numbers re-checked every hour until Ben clears them
 export const MAX_QUEUED = 200; // findings not yet delivered, carried hour to hour, worst first
 
 /** One finding: `id` is stable across hours so Ben hears about it once. Text never holds writer-chosen words. */
 export interface Finding { id: string; text: string }
 interface Open { job: string; req: string; at: number; stages: Stage[] }
-interface State { seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
+interface State { held?: number[]; seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
 
 const day = (d: Date) => d.toISOString().slice(0, 10);
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -141,6 +143,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   const open: Record<string, Open> = Object.assign(Object.create(null), prev.open && typeof prev.open === "object" ? prev.open : {});
   const days: Record<string, number> = Object.assign(Object.create(null), prev.days && typeof prev.days === "object" ? prev.days : {});
   let seq = Number.isInteger(prev.seq) ? prev.seq! : 0; // the last record number checked: the bookmark
+  const held = new Set((Array.isArray(prev.held) ? prev.held : []).filter((n) => Number.isInteger(n)));
   let swept = Array.isArray(prev.swept) ? prev.swept.filter(isFinding).slice(0, MAX_SWEPT) : [];
   // A record is read once, so a finding not yet delivered is carried until it is.
   const findings: Finding[] = Array.isArray(prev.queued) ? prev.queued.filter(isFinding).slice(0, MAX_QUEUED) : [];
@@ -173,23 +176,14 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
           break;
         }
         if (cands.length > 1) {
-          // Objects share a number: the recorder wrote at most one. Each is checked on its own and none
-          // counts toward its grant's order.
-          findings.push({ id: `duplicate-number:${next}`, text: `${cands.length} objects share record number ${next}: none is trusted; something wrote around the recorder` });
-          for (const o of cands) {
-            const m = KEY.exec(o.key)!;
-            const body = o.size > MAX_STORED_BYTES ? null : await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
-            const r = body === null ? undefined : await checkStored(next, m[2], m[3] as Stage, o.uploaded, body).catch(() => undefined);
-            if (r?.finding) findings.push({ ...r.finding, id: `${r.finding.id}:${m[2]}.${m[3]}` });
-            const d = day(o.uploaded);
-            days[d] = (days[d] ?? 0) + 1;
-          }
-          // The checker cannot tell which copy is the recorder's (it cannot read the recorder's ledger,
-          // by design), so it does not pass this number: the run stays unverified until Ben decides.
+          // Objects share a number: the recorder wrote at most one, and the checker cannot tell which
+          // (it cannot read the recorder's ledger, by design). The number is held: its copies are
+          // checked now and every hour after (so the recorder's own is checked whenever it lands),
+          // none counts toward a grant or a day, and reading goes on past it.
+          held.add(next);
+          seq = next;
           checked++;
-          verdict = "unverified";
-          reason = `record number ${next} has ${cands.length} objects: reading stopped there until Ben decides`;
-          break;
+          continue;
         }
         const o = cands[0], m = KEY.exec(o.key)!;
         const grant = m[2], stage = m[3] as Stage;
@@ -221,6 +215,23 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
         checked++;
       }
       if (checked === PAGE && verdict === "healthy") findings.push({ id: `backlog:${day(now)}`, text: `${PAGE} new records in an hour, over what the recorder can take: the rest are read next hour` });
+      // Held numbers: every copy re-checked each hour; the run stays unverified until Ben clears each.
+      const acked = new Set((env.RECORDS_HELD_ACK ?? "").split(",").map((x) => Number(x.trim())).filter((n) => Number.isInteger(n) && n > 0));
+      for (const n of [...held]) if (acked.has(n)) held.delete(n);
+      for (const n of [...held].sort((a, b) => a - b).slice(0, MAX_HELD)) {
+        const copies = (await namesAt(env.RECORDS, `${ROOT}${pad(n)}.`)).cands;
+        findings.push({ id: `duplicate-number:${n}`, text: `${copies.length} objects share record number ${n}: none is trusted; something wrote around the recorder` });
+        for (const o of copies) {
+          const m = KEY.exec(o.key)!;
+          const body = o.size > MAX_STORED_BYTES ? null : await env.RECORDS.get(o.key).then((b) => (b ? b.text() : null), () => null);
+          const r = body === null ? undefined : await checkStored(n, m[2], m[3] as Stage, o.uploaded, body).catch(() => undefined);
+          if (r?.finding) findings.push({ ...r.finding, id: `${r.finding.id}:${m[2]}.${m[3]}` });
+        }
+      }
+      if (held.size) {
+        verdict = "unverified";
+        reason = `record number${held.size === 1 ? "" : "s"} ${[...held].sort((a, b) => a - b).slice(0, MAX_HELD).join(", ")}${held.size > MAX_HELD ? " and more" : ""} held (shared by several objects): reading goes on, but the run stays unverified until Ben clears ${held.size === 1 ? "it" : "them"} in RECORDS_HELD_ACK`;
+      }
       findings.push(...(await strays(env.RECORDS)));
       if (now.getUTCHours() === SWEEP_HOUR) swept = await sweep(env.RECORDS, seq);
     } catch {
@@ -274,7 +285,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // Keep only what is still found, so a finding that comes back is told again.
   const still = new Set([...findings.map((f) => f.id), ...(verdict === "unverified" ? ["unverified"] : [])]);
   try {
-    await env.COPY.put(STATE_KEY, JSON.stringify({ seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
+    await env.COPY.put(STATE_KEY, JSON.stringify({ held: [...held], seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
   } catch {
     reason = `records state could not be saved; ${reason}`;
     verdict = "unverified";

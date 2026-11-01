@@ -201,7 +201,7 @@ test("security review: a stray name that sorts after every record is reported ea
   assert.match(second.reason, /something outside the record format/);
 });
 
-test("security review: two objects with one number are each checked, counted for neither grant, and reading stops there, unverified", async () => {
+test("security review: a shared number is held -- reading goes on, every copy is re-checked hourly, days are not inflated, and only Ben clears it", async () => {
   const b = bucket(), e = env(b), l = new Ledger(memory(), b);
   const req = rec("request"), h = await sha256(req);
   b.setClock(at(-10)); await l.accept(req, () => at(-10));
@@ -209,21 +209,21 @@ test("security review: two objects with one number are each checked, counted for
   await planted(b, 2, "grant-plant-a", "request", at(-9));
   await planted(b, 2, "grant-plant-b", "request", at(-9), { envelope: { sha256: "0".repeat(64) } });
   const first = await runRecords(e, wire().fetch, NOW);
-  assert.deepEqual([first.records, first.seq], ["unverified", 1]);
-  assert.match(first.reason, /record number 2 has 2 objects: reading stopped there until Ben decides/);
-  // The recorder writes its own 2, then 3, and a planted 3 as well: the checker still does not pass 2.
+  assert.deepEqual([first.records, first.seq], ["unverified", 2]);
+  assert.match(first.reason, /record number 2 held \(shared by several objects\): reading goes on, but the run stays unverified until Ben clears it in RECORDS_HELD_ACK/);
+  // The recorder writes its own 2 (a third copy, checked too) and then 3, which is read normally.
   b.setClock(at(1)); await l.accept(rec("approval", { request: h }), () => at(1));
   b.setClock(at(2)); await l.accept(rec("verdict", { request: h }), () => at(2));
-  await planted(b, 3, "grant-plant-c", "request", at(3));
   const w = wire();
   const second = await runRecords(e, w.fetch, at(60));
-  assert.deepEqual([second.records, second.seq], ["unverified", 1]);
-  assert.match(second.reason, /record number 2 has 3 objects/);
-  assert.deepEqual(w.hc(), ["/rec/fail"]); // its own check keeps failing every hour
-  // Every copy was checked: the broken one is reported, by fingerprint.
-  const queued = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
-  const told = [...(queued.alerted as string[]), ...(queued.queued as { id: string }[]).map((f) => f.id)];
-  assert.ok(told.some((id) => id.startsWith("bad:2:") && id.endsWith("grant-plant-b.request")), told.join(","));
+  assert.deepEqual([second.records, second.seq, second.checked], ["unverified", 3, 1]);
+  assert.deepEqual(w.hc(), ["/rec/fail"]); // its own check keeps failing every hour while held
+  const state = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
+  const ids = [...(state.alerted as string[]), ...(state.queued as { id: string }[]).map((f) => f.id)];
+  assert.ok(ids.some((id) => id.startsWith("bad:2:") && id.endsWith("grant-plant-b.request")), ids.join(","));
+  assert.equal(Object.values(state.days as Record<string, number>).reduce((x, y) => x + y, 0), 2); // records 1 and 3 only
+  // Ben looks and clears it: healthy again.
+  assert.equal((await runRecords({ ...e, RECORDS_HELD_ACK: " 2 " }, wire().fetch, at(120))).records, "healthy");
 });
 
 test("security review: junk names under the next number cannot hide the real record there", async () => {

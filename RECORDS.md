@@ -71,9 +71,11 @@ it accepted them. Each object holds an envelope, with the writer's bytes untouch
 
 Every record stored since its last run, asking for the next expected number by name each time,
 so names elsewhere in the bucket cost nothing and cannot hide records still to come (at most 500
-an hour; more is itself a finding). Two objects with one number: each is checked, none counts for
-its grant, and reading stops there, unverified, every hour until Ben decides (the checker cannot
-tell which copy is the recorder's, by design). A missing number with a
+an hour; more is itself a finding). Two objects with one number: the checker cannot tell which copy
+is the recorder's (by design it cannot read the recorder's ledger), so the number is held. Reading
+goes on past it; every copy at a held number is re-checked every hour, so the recorder's own is
+checked whenever it lands; none counts toward a grant or a day; and the run stays unverified until
+Ben adds the number to the `RECORDS_HELD_ACK` setting (comma-separated) after looking. A missing number with a
 higher one present is a standing gap finding. For each record: the name, the size, the envelope against the name and R2's upload time (within
 10 minutes), the hash, the record against this contract, and the order of each grant's stages
 (no duplicates, request first, approval before result, same request and job). Also: any gap in
