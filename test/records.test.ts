@@ -2,29 +2,30 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.ts";
 import { FRESH_CRON } from "../src/fresh.ts";
-import { checkOrder, checkRecord, DAY_CAP, MAX_RECORD_BYTES, MIN_LOCK_SECONDS, runRecords, shown, STATE_KEY, SWEEP_HOUR, type RecordsEnv, type Stored } from "../src/records.ts";
+import { DAY_CAP, keyFor, MAX_STORED_BYTES, sha256, type Stage } from "../src/contract.ts";
+import { Ledger, type Storage } from "../src/recorder/ledger.ts";
+import { MAX_QUEUED, MIN_LOCK_SECONDS, PAGE, runRecords, STATE_KEY, SWEEP_HOUR, type RecordsEnv } from "../src/records.ts";
 
 const NOW = new Date("2026-11-01T12:30:00Z");
 const MIN = 60_000;
 const at = (m: number) => new Date(NOW.getTime() + m * MIN);
 const G = "grant-0001";
-const key = (stage: string, grant = G, date = "2026-11-01") => `records/v1/${date}/${grant}/${stage}.json`;
-const body = (stage: string, when: Date, over: object = {}, grant = G) => JSON.stringify({ v: 1, grant, stage, at: when.toISOString(), job: "test.echo", ...over });
 
-// An R2 bucket in memory: list with prefix, delimiter and pages of `pageSize`; get; put.
+// An R2 bucket in memory: list with prefix, delimiter, startAfter and pages; get; head; put.
 function bucket(pageSize = 1000) {
-  const store = new Map<string, { body: string; uploaded: Date; size?: number }>();
-  const gets: string[] = [];
-  let failList = false;
+  const store = new Map<string, { body: string; uploaded: Date; size?: number; sha?: string }>();
+  let failList = false, clock = NOW;
+  const unreadable = new Set<string>();
   return {
-    store, gets,
+    store, unreadable,
     failList: () => { failList = true; },
+    setClock(d: Date) { clock = d; },
     add(k: string, b: string, uploaded: Date, size?: number) { store.set(k, { body: b, uploaded, size }); },
-    async list(o: { prefix?: string; delimiter?: string; cursor?: string; limit?: number }) {
+    async list(o: { prefix?: string; delimiter?: string; cursor?: string; startAfter?: string; limit?: number }) {
       if (failList) throw new Error("R2 down");
-      const prefix = o.prefix ?? "", start = Number(o.cursor ?? 0);
+      const prefix = o.prefix ?? "", start = Number(o.cursor ?? 0), limit = Math.min(o.limit ?? 1000, pageSize);
       const objects: R2Object[] = [], prefixes = new Set<string>();
-      for (const k of [...store.keys()].sort().filter((x) => x.startsWith(prefix))) {
+      for (const k of [...store.keys()].sort().filter((x) => x.startsWith(prefix) && (!o.startAfter || x > o.startAfter))) {
         const rest = k.slice(prefix.length), cut = o.delimiter ? rest.indexOf(o.delimiter) : -1;
         if (cut >= 0) prefixes.add(prefix + rest.slice(0, cut + 1));
         else {
@@ -32,30 +33,59 @@ function bucket(pageSize = 1000) {
           objects.push({ key: k, size: v.size ?? v.body.length, uploaded: v.uploaded } as R2Object);
         }
       }
-      const page = objects.slice(start, start + pageSize), more = start + pageSize < objects.length;
-      return { objects: page, delimitedPrefixes: [...prefixes], truncated: more, cursor: more ? String(start + pageSize) : undefined } as R2Objects;
+      const page = objects.slice(start, start + limit), more = start + limit < objects.length;
+      return { objects: page, delimitedPrefixes: [...prefixes], truncated: more, cursor: more ? String(start + limit) : undefined } as R2Objects;
     },
     async get(k: string) {
-      gets.push(k);
       const v = store.get(k);
+      if (unreadable.has(k)) throw new Error("read failed");
       return v ? ({ text: async () => v.body } as R2ObjectBody) : null;
     },
-    async put(k: string, b: string) { store.set(k, { body: b, uploaded: NOW }); return {} as R2Object; },
+    async head(k: string) { const v = store.get(k); return v ? ({ key: k, customMetadata: { sha256: v.sha } } as unknown as R2Object) : null; },
+    async put(k: string, b: string, o?: R2PutOptions) { store.set(k, { body: b, uploaded: clock, sha: o?.customMetadata?.sha256 }); return {} as R2Object; },
   };
 }
+type B = ReturnType<typeof bucket>;
 
-function wire(lockRules?: object[]) {
+function memory(): Storage {
+  const m = new Map<string, unknown>();
+  return { async get<T>(k: string) { return structuredClone(m.get(k)) as T | undefined; }, async put(e) { for (const [k, v] of Object.entries(e)) m.set(k, structuredClone(v)); }, async delete(k) { return m.delete(k); } };
+}
+const rec = (stage: string, over: object = {}, grant = G) => JSON.stringify({ v: 1, grant, stage, job: "cf.token.canary", ...over });
+
+/** Records written the real way, through the recorder's ledger, each stored at its own minute. */
+async function viaRecorder(b: B, grants = [G], start = -10, stages: Stage[] = ["request", "verdict", "approval", "result"]) {
+  const l = new Ledger(memory(), b);
+  let m = start;
+  for (const g of grants) {
+    const req = rec("request", {}, g), h = await sha256(req);
+    for (const s of stages) {
+      const when = at(m++);
+      b.setClock(when);
+      await l.accept(s === "request" ? req : rec(s, { request: h }, g), () => when);
+    }
+  }
+  return l;
+}
+/** A record placed straight into the bucket, as something around the recorder would. */
+async function planted(b: B, seq: number, grant: string, stage: Stage, uploaded: Date, over: { body?: string; envelope?: object; request?: string } = {}) {
+  const body = over.body ?? rec(stage, stage === "request" ? {} : { request: over.request ?? "a".repeat(64) }, grant);
+  const env = { v: 1, seq, grant, stage, recorded_at: uploaded.toISOString(), sha256: await sha256(body), body, ...over.envelope };
+  b.add(keyFor(seq, grant, stage), JSON.stringify(env), uploaded);
+}
+
+function wire(lockRules?: object[], pushover = 200, hc = 200) {
   const calls: { host: string; path: string; body: string }[] = [];
   const fetch = async (req: Request) => {
     const url = new URL(req.url);
     calls.push({ host: url.hostname, path: url.pathname, body: await req.text() });
     if (url.hostname === "api.cloudflare.com") return Response.json({ success: true, result: { rules: lockRules ?? [] } });
-    return new Response("{}", { status: 200 });
+    if (url.hostname === "api.pushover.net") return new Response("{}", { status: pushover });
+    return new Response("{}", { status: hc });
   };
   return { calls, fetch, pushes: () => calls.filter((c) => c.host === "api.pushover.net"), hc: () => calls.filter((c) => c.host === "hc-records.example").map((c) => c.path) };
 }
-
-const env = (records: ReturnType<typeof bucket> | undefined, over: Partial<RecordsEnv> = {}): RecordsEnv => ({
+const env = (records: B | undefined, over: Partial<Omit<RecordsEnv, "COPY">> = {}): RecordsEnv & { COPY: B } => ({
   RECORDS: records,
   COPY: bucket(),
   PING_URL: "https://hc-backup.example/night",
@@ -64,163 +94,239 @@ const env = (records: ReturnType<typeof bucket> | undefined, over: Partial<Recor
   PUSHOVER_USER: "b".repeat(30),
   ...over,
 });
+const ids = async (e: RecordsEnv & { COPY: B }) => JSON.parse(e.COPY.store.get(STATE_KEY)!.body).alerted as string[];
+const reasonOf = async (b: B, now = NOW) => (await runRecords(env(b), wire().fetch, now)).reason;
 
-/** A grant written in order: request, verdict, approval, result, a minute apart. */
-function wholeGrant(b: ReturnType<typeof bucket>, grant = G, start = -10) {
-  ["request", "verdict", "approval", "result"].forEach((s, i) => b.add(key(s, grant), body(s, at(start + i), {}, grant), at(start + i)));
-}
-
-const stored = (k: string, uploaded = NOW, size = 100): Stored => ({ key: k, size, uploaded });
-
-test("a grant recorded in order is healthy, and the run pings its own check", async () => {
+test("grants recorded through the recorder are healthy, and the run pings its own check", async () => {
   const b = bucket(), w = wire();
-  wholeGrant(b);
+  await viaRecorder(b, [G, "grant-0002"]);
   const r = await runRecords(env(b), w.fetch, NOW);
-  assert.equal(r.records, "healthy");
-  assert.equal(r.checked, 4);
+  assert.deepEqual([r.records, r.checked, r.seq], ["healthy", 8, 8]);
   assert.deepEqual(w.hc(), ["/rec"]);
   assert.equal(w.pushes().length, 0);
 });
 
-test("a result with no earlier request is 'ran unrecorded'", () => {
-  const f = checkOrder([stored(key("approval"), at(-2)), stored(key("result"), at(-1))]);
-  assert.match(f.map((x) => x.text).join(), /ran unrecorded/);
+test("the bookmark: each hour reads only what is new, and a grant across midnight stays in order", async () => {
+  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
+  const req = rec("request"), h = await sha256(req);
+  const t1 = new Date("2026-11-01T23:59:00Z");
+  b.setClock(t1);
+  await l.accept(req, () => t1);
+  assert.equal((await runRecords(e, wire().fetch, new Date("2026-11-02T00:30:00Z"))).checked, 1);
+  for (const [s, t] of [["approval", "2026-11-02T00:31:00Z"], ["result", "2026-11-02T00:32:00Z"]] as const) {
+    b.setClock(new Date(t));
+    await l.accept(rec(s, { request: h }), () => new Date(t));
+  }
+  const two = await runRecords(e, wire().fetch, new Date("2026-11-03T01:30:00Z"));
+  assert.deepEqual([two.records, two.checked, two.seq], ["healthy", 2, 3]);
+  assert.equal((await runRecords(e, wire().fetch, new Date("2026-11-03T02:30:00Z"))).checked, 0);
 });
 
-test("a request stored after the result does not count as earlier", () => {
-  const f = checkOrder([stored(key("result"), at(-3)), stored(key("approval"), at(-4)), stored(key("request"), at(-2))]);
-  assert.equal(f[0].id, `unrecorded:${G}`);
+test("order: result with no request is 'ran unrecorded'; no approval; approval or verdict first", async () => {
+  const b = bucket();
+  await planted(b, 1, "grant-aaaa", "result", at(-5));
+  await planted(b, 2, "grant-bbbb", "request", at(-4));
+  const h = await sha256(rec("request", {}, "grant-bbbb"));
+  await planted(b, 3, "grant-bbbb", "result", at(-3), { request: h });
+  await planted(b, 4, "grant-cccc", "approval", at(-2));
+  await planted(b, 5, "grant-dddd", "verdict", at(-1));
+  const why = await reasonOf(b);
+  assert.match(why, /grant grant-aaaa has a result with no request record before it: something ran unrecorded/);
+  assert.match(why, /grant grant-bbbb has a result with no approval record before it/);
+  assert.match(why, /grant grant-cccc has an approval with no request record before it/);
+  assert.match(why, /grant grant-dddd has a verdict with no request record before it/);
 });
 
-test("a result with a request but no approval is flagged", () => {
-  const f = checkOrder([stored(key("request"), at(-3)), stored(key("result"), at(-1))]);
-  assert.deepEqual(f.map((x) => x.id), [`unapproved:${G}`]);
+test("r1 #3: a second stage for a grant is flagged, so a later duplicate cannot hide an earlier bad result", async () => {
+  const b = bucket(), h = await sha256(rec("request"));
+  await planted(b, 1, G, "request", at(-5));
+  await planted(b, 2, G, "result", at(-4), { request: h }); // result before approval
+  await planted(b, 3, G, "approval", at(-3), { request: h });
+  await planted(b, 4, G, "result", at(-2), { request: h });
+  const why = await reasonOf(b);
+  assert.match(why, /grant grant-0001 has a result with no approval record before it/);
+  assert.match(why, /grant grant-0001 has a second result record/);
 });
 
-test("an approval or verdict with no earlier request is flagged", () => {
-  const f = checkOrder([stored(key("approval"), at(-3)), stored(key("verdict"), at(-2))]);
-  assert.deepEqual(f.map((x) => x.id).sort(), [`approval-first:${G}`, `verdict-first:${G}`]);
+test("a later record naming another request or job is a mismatch", async () => {
+  const b = bucket();
+  await planted(b, 1, G, "request", at(-5));
+  await planted(b, 2, G, "approval", at(-4), { request: "f".repeat(64) });
+  assert.match(await reasonOf(b), /grant grant-0001: a later record names a different request or job than its request record/);
 });
 
-test("a request with nothing after it yet is fine (Ben has not tapped)", () => {
-  assert.deepEqual(checkOrder([stored(key("request"))]), []);
+test("r1 #1 and r1 #8: names out of sequence are gaps; ties are impossible because order is the recorder's number", async () => {
+  const b = bucket();
+  await viaRecorder(b, [G], -10, ["request"]);
+  await planted(b, 7, "grant-late", "request", at(-1));
+  assert.match(await reasonOf(b), /record numbers jumped from 1 to 7/);
 });
 
-test("a record whose own time is far from when R2 stored it is backdated", () => {
-  const f = checkRecord(stored(key("request"), NOW), body("request", at(-11)));
-  assert.match(f[0].text, /more than 10 minutes/);
-  assert.deepEqual(checkRecord(stored(key("request"), NOW), body("request", at(-9))), []);
+test("anything not named by the recorder is a stray, anywhere in the bucket, and its name is never repeated", async () => {
+  const b = bucket();
+  await viaRecorder(b);
+  b.add("records/v1/2026-10-29/grant-0001/result.json", "{}", at(-1));
+  b.add("records/v1/zzz-password_MARKER", "{}", at(-1));
+  b.add("records/other/x", "{}", at(-1));
+  b.add("loose_SECRET_NAME", "{}", at(-1));
+  const why = await reasonOf(b);
+  assert.equal((why.match(/something outside the record format, fingerprint [0-9a-f]{12}/g) ?? []).length, 4);
+  assert.ok(!/MARKER|SECRET_NAME|2026-10-29|other/.test(why), why);
 });
 
-test("a record filed under another day than its time is flagged", () => {
-  const f = checkRecord(stored(key("request", G, "2026-10-31")), body("request", NOW));
-  assert.match(f[0].text, /filed under 2026-10-31/);
-});
-
-test("each broken body is flagged with its reason", () => {
-  const cases: [string, RegExp][] = [
-    ["not json", /not JSON/],
-    ["[]", /not a JSON object/],
-    [JSON.stringify({ v: 2 }), /not version 1/],
-    [body("approval", NOW), /different grant or stage/],
-    [body("request", NOW, {}, "grant-9999"), /different grant or stage/],
-    [body("request", NOW, { job: "Bad Job" }), /no valid job name/],
-    [body("request", NOW, { at: "yesterday" }), /no valid `at`/],
-    [body("request", NOW, { params: { api_token: "x" } }), /has 1 field named like a secret$/],
-    [body("request", NOW, { at: "November 1, 2026 12:30" }), /no valid `at`/],
+test("each broken stored record is flagged with a fixed reason", async () => {
+  const b = bucket(), cases: [object, RegExp][] = [
+    [{ envelope: { seq: 99 } }, /its envelope does not match its name/],
+    [{ envelope: { recorded_at: at(-60).toISOString() } }, /its recorded time is missing or far from when it was stored/],
+    [{ envelope: { sha256: "0".repeat(64) } }, /its body does not match its hash/],
+    [{ body: rec("request", { params: { password_MARKER: 1 } }) }, /a field named like a secret, or nested too deep/],
+    [{ body: rec("request", {}, "grant-other") }, /its body names a different grant or stage than its name/],
   ];
-  for (const [b, why] of cases) assert.match(checkRecord(stored(key("request")), b)[0]?.text ?? "none", why, b);
+  let seq = 0;
+  for (const [over] of cases) { seq++; await planted(b, seq, `grant-${String(seq).padStart(4, "0")}`, "request", at(-5 + seq), over); }
+  b.add(keyFor(++seq, "grant-json", "request"), "not json", at(0));
+  const why = await reasonOf(b);
+  for (const [, re] of cases) assert.match(why, re);
+  assert.match(why, /record 6 \(grant-json\/request\): not JSON/);
+  assert.ok(!why.includes("MARKER"));
 });
 
-test("an oversized record is flagged by size and never downloaded", async () => {
-  const b = bucket(), w = wire();
-  b.add(key("request"), body("request", NOW), NOW, MAX_RECORD_BYTES + 1);
-  const r = await runRecords(env(b), w.fetch, NOW);
-  assert.equal(r.records, "findings");
-  assert.match(r.reason, /over 8192/);
-  assert.deepEqual(b.gets, []);
+test("an oversized object is flagged by size and never downloaded", async () => {
+  const b = bucket();
+  let gets = 0;
+  const get = b.get.bind(b);
+  b.get = async (k: string) => { gets++; return get(k); };
+  b.add(keyFor(1, G, "request"), "x", at(-1), MAX_STORED_BYTES + 1);
+  assert.match(await reasonOf(b), new RegExp(`record 1 \\(grant-0001/request\\): ${MAX_STORED_BYTES + 1} bytes`));
+  assert.equal(gets, 0);
 });
 
-test("anything outside records/v1/ is a stray, files and folders alike", async () => {
-  const b = bucket(), w = wire();
-  b.add("notes.txt", "hi", NOW);
-  b.add("records/v2/x.json", "{}", NOW);
-  b.add("records/v1/2026-11-01/short/request.json", body("request", NOW), NOW);
-  const r = await runRecords(env(b), w.fetch, NOW);
-  assert.match(r.reason, /object outside the record format: notes\.txt/);
-  assert.match(r.reason, /folder outside the record format: records\/v2\//);
-  assert.match(r.reason, /object outside the record format: records\/v1\/2026-11-01\/short/);
+test("r1 #6: work per hour is bounded; a flood beyond a page is flagged and read on later hours", async () => {
+  const b = bucket(), e = env(b);
+  for (let i = 1; i <= PAGE + 3; i++) await planted(b, i, `grant-${String(i).padStart(5, "0")}`, "request", at(-1));
+  const first = await runRecords(e, wire().fetch, NOW);
+  assert.equal(first.checked, PAGE);
+  assert.match(first.reason, new RegExp(`more than ${PAGE} new records in an hour`));
+  assert.match(first.reason, new RegExp(`${PAGE} records stored on 2026-11-01, over the cap of ${DAY_CAP}`));
+  assert.equal((await runRecords(e, wire().fetch, at(60))).checked, 3);
 });
 
-test("a day over the cap alerts, reads no more than the cap, and follows R2's pages", async () => {
-  const b = bucket(100), w = wire();
-  for (let i = 0; i <= DAY_CAP; i++) b.add(key("request", `grant-${String(i).padStart(4, "0")}`), body("request", NOW, {}, `grant-${String(i).padStart(4, "0")}`), NOW);
-  const r = await runRecords(env(b), w.fetch, NOW);
-  assert.match(r.reason, new RegExp(`${DAY_CAP + 1} records on 2026-11-01, over the cap`));
-  assert.equal(b.gets.length, DAY_CAP);
-});
-
-test("yesterday's folder is read too, so a grant across midnight stays in order", async () => {
-  const b = bucket(), w = wire(), midnight = new Date("2026-11-01T00:00:30Z");
-  b.add(key("request", G, "2026-10-31"), body("request", new Date("2026-10-31T23:59:00Z")), new Date("2026-10-31T23:59:00Z"));
-  b.add(key("approval"), body("approval", midnight), midnight);
-  b.add(key("result"), body("result", midnight), midnight);
-  const r = await runRecords(env(b), w.fetch, new Date("2026-11-01T00:30:00Z"));
-  assert.equal(r.records, "healthy", r.reason);
+test("a record that cannot be read stops the run there, unverified, and is read again next hour", async () => {
+  const b = bucket(), e = env(b);
+  await viaRecorder(b);
+  b.unreadable.add(keyFor(3, G, "approval"));
+  const r = await runRecords(e, wire().fetch, NOW);
+  assert.deepEqual([r.records, r.checked], ["unverified", 2]);
+  b.unreadable.clear();
+  const again = await runRecords(e, wire().fetch, at(60));
+  assert.deepEqual([again.records, again.checked], ["healthy", 2]);
 });
 
 test("a finding alerts once, stays quiet while it lasts, and alerts again if it comes back", async () => {
-  const b = bucket(), copy = bucket(), w = wire();
-  b.add(key("result"), body("result", NOW), NOW);
-  const e = env(b, { COPY: copy });
+  const b = bucket(), e = env(b);
+  b.add("stray", "{}", at(-1));
+  const w1 = wire();
+  await runRecords(e, w1.fetch, NOW);
+  assert.equal(w1.pushes().length, 1);
+  const w2 = wire();
+  await runRecords(e, w2.fetch, at(60));
+  assert.equal(w2.pushes().length, 0);
+  assert.deepEqual(w2.hc(), ["/rec/fail"]);
+  b.store.delete("stray");
+  await runRecords(e, wire().fetch, at(120));
+  b.add("stray", "{}", at(121));
+  const w4 = wire();
+  await runRecords(e, w4.fetch, at(180));
+  assert.equal(w4.pushes().length, 1);
+});
+
+test("r1 #4: an alert holds what fits, worst first; only what was sent counts as told; the rest follow next hour", async () => {
+  const b = bucket(), e = env(b);
+  for (let i = 1; i <= 30; i++) await planted(b, i, `grant-${String(i).padStart(4, "0")}`, "result", at(-1));
+  b.add("stray", "{}", at(-1));
+  const w = wire();
   await runRecords(e, w.fetch, NOW);
-  await runRecords(e, w.fetch, NOW);
-  assert.equal(w.pushes().length, 1);
-  assert.deepEqual(w.hc(), ["/rec/fail", "/rec/fail"]); // bad every hour, told once
-  b.store.clear();
-  await runRecords(e, w.fetch, NOW);
-  assert.deepEqual(JSON.parse(copy.store.get(STATE_KEY)!.body), { alerted: [], swept: [] });
-  b.add(key("result"), body("result", NOW), NOW);
-  await runRecords(e, w.fetch, NOW);
-  assert.equal(w.pushes().length, 2);
+  const msg = new URLSearchParams(w.pushes()[0].body).get("message")!;
+  assert.ok(msg.length <= 1024);
+  assert.match(msg.split("\n")[0], /ran unrecorded/); // worst first; the stray waits
+  const told = await ids(e);
+  assert.ok(told.length > 0 && told.length < 31);
+  // The bookmark has passed those records, yet the untold ones still arrive in the next hours.
+  const heard = new Set(told);
+  for (let h = 1; h <= 10 && heard.size < 31; h++) {
+    await runRecords(e, wire().fetch, at(60 * h));
+    for (const id of await ids(e)) heard.add(id);
+  }
+  assert.equal(heard.size, 31);
+});
+
+test("r1 #5: an alert no channel took is not told; it is tried again next hour", async () => {
+  const b = bucket(), e = env(b);
+  await planted(b, 1, G, "result", at(-1));
+  const down = wire(undefined, 503, 503);
+  await runRecords(e, down.fetch, NOW);
+  assert.equal(down.pushes().length, 1);
+  assert.deepEqual(await ids(e), []);
+  const up = wire();
+  await runRecords(e, up.fetch, at(60));
+  assert.equal(up.pushes().length, 1);
+  assert.match(new URLSearchParams(up.pushes()[0].body).get("message")!, /ran unrecorded/);
+});
+
+test("undelivered findings carried hour to hour are bounded, with a line saying more were dropped", async () => {
+  const b = bucket(), e = env(b, { PING_URL_RECORDS: undefined });
+  for (let i = 1; i <= MAX_QUEUED + 20; i++) await planted(b, i, `grant-${String(i).padStart(4, "0")}`, "result", at(-1));
+  await runRecords(e, wire().fetch, NOW);
+  const queued = JSON.parse(e.COPY.store.get(STATE_KEY)!.body).queued as { id: string }[];
+  assert.equal(queued.length, MAX_QUEUED);
+  assert.equal(queued.at(-1)!.id, "queued:more");
 });
 
 test("without its own check it only logs: no alert, nothing claims healthy", async () => {
   const b = bucket(), w = wire();
-  b.add(key("result"), body("result", NOW), NOW);
+  b.add("stray", "{}", at(-1));
   const r = await runRecords(env(b, { PING_URL_RECORDS: undefined }), w.fetch, NOW);
   assert.equal(r.setup, "PING_URL_RECORDS not set: log only");
-  assert.equal(w.calls.length, 0);
+  assert.equal(w.calls.filter((c) => c.host !== "api.cloudflare.com").length, 0);
 });
 
 test("no binding, or a list that fails, is unverified, never healthy", async () => {
-  const w1 = wire();
-  assert.equal((await runRecords(env(undefined), w1.fetch, NOW)).records, "unverified");
-  assert.equal(w1.pushes().length, 1);
-  const b = bucket(), w2 = wire();
+  assert.equal((await runRecords(env(undefined), wire().fetch, NOW)).records, "unverified");
+  const b = bucket();
   b.failList();
-  const r = await runRecords(env(b), w2.fetch, NOW);
-  assert.equal(r.records, "unverified");
-  assert.equal(r.reason, "the records could not be listed");
-  assert.equal(w2.pushes().length, 1);
+  const w = wire();
+  const r = await runRecords(env(b), w.fetch, NOW);
+  assert.deepEqual([r.records, r.reason], ["unverified", "the records could not be listed"]);
+  assert.equal(w.pushes().length, 1);
 });
 
 test("the records lock is read and a short one is a finding; no key yet claims nothing", async () => {
-  const b = bucket(), lockEnv = { LOCK_READ_TOKEN: "t".repeat(40), LOCK_ACCOUNT_ID: "f".repeat(32) };
-  wholeGrant(b);
-  const short = wire([{ enabled: true, prefix: "records/", condition: { type: "Age", maxAgeSeconds: 30 * 86_400 } }]);
-  const r = await runRecords(env(b, lockEnv), short.fetch, NOW);
-  assert.equal(r.lock, "short");
-  assert.match(r.reason, /records lock: lock rule on "records\/" holds 30 days/);
-  assert.ok(short.calls.some((c) => c.path.endsWith("/r2/buckets/observatory-records/lock")));
-  const ok = wire([{ enabled: true, prefix: "records/", condition: { type: "Age", maxAgeSeconds: MIN_LOCK_SECONDS } }]);
-  assert.equal((await runRecords(env(b, lockEnv), ok.fetch, NOW)).records, "healthy");
+  const b = bucket();
+  const lockEnv = { LOCK_READ_TOKEN: "t".repeat(40), LOCK_ACCOUNT_ID: "f".repeat(32) };
+  const short = await runRecords(env(b, lockEnv), wire([{ id: "r", enabled: true, prefix: "records/", condition: { type: "Age", maxAgeSeconds: 86_400 } }]).fetch, NOW);
+  assert.equal(short.lock, "short");
+  const good = await runRecords(env(b, lockEnv), wire([{ id: "r", enabled: true, prefix: "records/", condition: { type: "Age", maxAgeSeconds: MIN_LOCK_SECONDS } }]).fetch, NOW);
+  assert.equal(good.lock, "ok");
   assert.equal((await runRecords(env(b), wire().fetch, NOW)).lock, "not set up");
+});
+
+test("once a day the bucket is counted: an object written around the recorder below the bookmark is caught", async () => {
+  const b = bucket(), e = env(b);
+  await viaRecorder(b);
+  await runRecords(e, wire().fetch, NOW);
+  // Inserted under a name that sorts before the bookmark: the hourly read never sees it.
+  await planted(b, 2, "grant-aaaa", "request", at(5));
+  assert.equal((await runRecords(e, wire().fetch, at(60))).records, "healthy");
+  const sweep = new Date("2026-11-02T04:30:00Z");
+  assert.equal(sweep.getUTCHours(), SWEEP_HOUR);
+  assert.match((await runRecords(e, wire().fetch, sweep)).reason, /the bucket holds 5 records but the recorder numbered 4: something wrote around the recorder/);
+  // Carried through the following hours until the next sweep.
+  assert.match((await runRecords(e, wire().fetch, new Date("2026-11-02T05:30:00Z"))).reason, /something wrote around the recorder/);
 });
 
 test("the hourly cron runs the records check as its own job", async () => {
   const b = bucket(), w = wire(), jobs: Promise<unknown>[] = [];
-  wholeGrant(b);
+  await viaRecorder(b);
   const origFetch = globalThis.fetch;
   globalThis.fetch = w.fetch as typeof fetch;
   try {
@@ -231,64 +337,4 @@ test("the hourly cron runs the records check as its own job", async () => {
   }
   assert.equal(jobs.length, 2);
   assert.ok(w.calls.some((c) => c.host === "hc-records.example"));
-});
-
-test("what the writer chose is never echoed raw: secret names, its time, odd characters in names", () => {
-  const f = checkRecord(stored(key("request")), body("request", NOW, { params: { "sk_live_ABC123token": "x" } }));
-  assert.doesNotMatch(f[0].text, /sk_live/);
-  const late = checkRecord(stored(key("request"), NOW), body("request", at(-30)));
-  assert.match(late[0].text, /2026-11-01T12:00:00\.000Z/);
-  assert.equal(shown("a b\nc<script>".repeat(10)).length, 60);
-  assert.match(shown("x y\n"), /^x\?y\?$/);
-});
-
-test("folders that are not a real date, or are in the future, are flagged every hour", async () => {
-  const b = bucket(), w = wire();
-  b.add(key("request", G, "2099-01-01"), body("request", NOW), NOW);
-  b.add("records/v1/2026-13-45/grant-0001/request.json", "{}", NOW);
-  const r = await runRecords(env(b), w.fetch, NOW);
-  assert.match(r.reason, /future day: records\/v1\/2099-01-01\//);
-  assert.match(r.reason, /folder outside the record format: records\/v1\/2026-13-45\//);
-});
-
-test("once a day every record is swept: one stored today into an old folder is caught", async () => {
-  const b = bucket(), w = wire(), sweepTime = new Date(`2026-11-01T0${SWEEP_HOUR}:30:00Z`);
-  b.add(key("result", G, "2026-10-20"), body("result", new Date("2026-10-20T12:00:00Z")), sweepTime);
-  b.add(key("request", "grant-0002", "2026-10-20"), body("request", new Date("2026-10-20T12:00:00Z"), {}, "grant-0002"), new Date("2026-10-20T12:00:00Z"));
-  const quiet = await runRecords(env(b), w.fetch, new Date("2026-11-01T12:30:00Z"));
-  assert.equal(quiet.records, "healthy", "outside the sweep hour, old folders are not listed");
-  const r = await runRecords(env(b), w.fetch, sweepTime);
-  assert.match(r.reason, /grant-0001\/result was stored 2026-11-01 into the 2026-10-20 folder/);
-  assert.doesNotMatch(r.reason, /grant-0002/);
-});
-
-test("an alert holds what fits, worst first; the rest are told next hour", async () => {
-  const b = bucket(), copy = bucket(), w = wire();
-  for (let i = 0; i < 30; i++) b.add(`stray-${String(i).padStart(2, "0")}-${"x".repeat(40)}`, "x", NOW);
-  b.add(key("result"), body("result", NOW), NOW);
-  const e = env(b, { COPY: copy });
-  await runRecords(e, w.fetch, NOW);
-  const first = new URLSearchParams(w.pushes()[0].body).get("message")!;
-  assert.match(first.split("\n")[0], /ran unrecorded/);
-  assert.match(first, /\(\+\d+ more, sent next hour\)/);
-  const told1 = JSON.parse(copy.store.get(STATE_KEY)!.body).alerted.length;
-  assert.ok(told1 < 31);
-  for (let h = 0; h < 5; h++) await runRecords(e, w.fetch, NOW);
-  assert.equal(JSON.parse(copy.store.get(STATE_KEY)!.body).alerted.length, 31);
-  assert.doesNotMatch(new URLSearchParams(w.pushes().at(-1)!.body).get("message")!, /more, sent next hour/);
-});
-
-test("sweep findings that did not fit at 04:30 are carried and told in the next hours", async () => {
-  const b = bucket(), copy = bucket(), w = wire(), sweepTime = new Date(`2026-11-01T0${SWEEP_HOUR}:30:00Z`);
-  for (let i = 0; i < 30; i++) {
-    const g = `grant-${String(i).padStart(4, "0")}`;
-    b.add(key("request", g, "2026-10-20"), body("request", new Date("2026-10-20T12:00:00Z"), {}, g), sweepTime);
-  }
-  const e = env(b, { COPY: copy });
-  await runRecords(e, w.fetch, sweepTime);
-  assert.ok(JSON.parse(copy.store.get(STATE_KEY)!.body).alerted.length < 30);
-  for (let h = 1; h <= 5; h++) await runRecords(e, w.fetch, new Date(sweepTime.getTime() + h * 3_600_000));
-  const state = JSON.parse(copy.store.get(STATE_KEY)!.body);
-  assert.equal(state.alerted.length, 30);
-  assert.equal(state.swept.length, 30);
 });
