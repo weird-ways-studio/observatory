@@ -367,6 +367,25 @@ test("security review: a re-check that stops short never marks unchecked numbers
   assert.match(next.reason, /record 3 was read before the key was pinned/);
 });
 
+test("Codex r2 #2: a re-check longer than one hour's budget picks up where it stopped and never skips the last number", async () => {
+  const pair = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+  const pin = { key: b64((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer), from: 1 };
+  const b = bucket(), e = env(b), t0 = new Date("2026-11-01T10:00:00Z");
+  for (let n = 1; n <= PAGE; n++) {
+    const g = `grant-s${String(n).padStart(4, "0")}`, body = rec("request", {}, g);
+    const x: Envelope = { v: 2, seq: n, grant: g, stage: "request", recorded_at: t0.toISOString(), sha256: await sha256(body), body };
+    b.add(keyFor(n, g, "request"), JSON.stringify({ ...x, sig: b64(await crypto.subtle.sign("Ed25519", pair.privateKey, sealed(x))) }), t0);
+  }
+  await planted(b, PAGE + 1, "grant-unsig", "request", t0); // the last one, unsigned
+  for (const h of [0, 1]) await runRecords(e, wire().fetch, new Date(`2026-11-01T1${h}:30:00Z`), undefined); // read through unsigned
+  const one = await runRecords(e, wire().fetch, new Date("2026-11-01T12:30:00Z"), pin);
+  assert.equal(one.records, "unverified");
+  assert.equal(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).sealed.to, PAGE);
+  const two = await runRecords(e, wire().fetch, new Date("2026-11-01T13:30:00Z"), pin);
+  assert.notEqual(two.records, "healthy");
+  assert.match(two.reason, new RegExp(`record ${PAGE + 1} was read before the key was pinned`));
+});
+
 test("security review: two signed copies found by the re-check stop it there, unverified", async () => {
   const pair = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
   const pin = { key: b64((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer), from: 1 };
