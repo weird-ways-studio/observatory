@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DAY_CAP, keyFor, MAX_RECORD_BYTES, MAX_STORED_BYTES, sha256, SKEW_MS, STAGE_SLOTS, STORE_BUDGET_BYTES, validate, type Envelope, type Receipt } from "../src/contract.ts";
+import { DAY_CAP, keyFor, MAX_RECORD_BYTES, MAX_STORED_BYTES, sealed, sha256, SKEW_MS, STAGE_SLOTS, STORE_BUDGET_BYTES, unb64, validate, type Envelope, type Receipt } from "../src/contract.ts";
 import { admit, resetCerts, type AccessEnv } from "../src/recorder/access.ts";
 import { handle } from "../src/recorder/http.ts";
 import { Ledger, type Storage } from "../src/recorder/ledger.ts";
@@ -185,7 +185,7 @@ test("the day's cap: requests reserve their grant's slots, so admitted grants ca
   // Next UTC day: the open grants' reserved slots carry over (100 x 3 - 1 used), so only the rest is new room.
   const carried = grants * (STAGE_SLOTS - 1) - 1;
   assert.equal((await l.accept(rec("request", {}, "grant-tomorrow"), () => new Date("2026-11-02T00:00:01Z"))).status, 201);
-  assert.deepEqual(await l.status(new Date("2026-11-02T01:00:00Z")), { seq: grants + 2, used_today: carried + STAGE_SLOTS, cap: DAY_CAP, stored_bytes: (await l.status(NOW)).stored_bytes, budget_bytes: STORE_BUDGET_BYTES, pending: false });
+  assert.deepEqual(await l.status(new Date("2026-11-02T01:00:00Z")), { seq: grants + 2, used_today: carried + STAGE_SLOTS, cap: DAY_CAP, stored_bytes: (await l.status(NOW)).stored_bytes, budget_bytes: STORE_BUDGET_BYTES, pending: false, public_key: (await l.status(NOW)).public_key });
 });
 
 test("Codex r1: midnight does not reset the cap -- yesterday's open grants' slots carry over, so no UTC day takes more than the cap", async () => {
@@ -413,4 +413,43 @@ test("the address: two paths only; the login check runs before the body is read;
   const shown = (await status.json()) as Record<string, unknown>;
   assert.deepEqual([shown.seq, shown.used_today, shown.cap, shown.pending, shown.budget_bytes], [1, STAGE_SLOTS, DAY_CAP, false, STORE_BUDGET_BYTES]);
   assert.ok((shown.stored_bytes as number) > 0);
+});
+
+/** True if the stored envelope at `key` verifies against the recorder's public key from its status. */
+async function sealedOk(l: Ledger, b: ReturnType<typeof bucket>, key: string) {
+  const pub = await crypto.subtle.importKey("raw", unb64((await l.status(NOW)).public_key), "Ed25519", false, ["verify"]);
+  const x = JSON.parse(b.store.get(key)!.body) as Envelope;
+  return x.v === 2 && crypto.subtle.verify("Ed25519", pub, unb64(x.sig!), sealed(x));
+}
+
+test("every stored envelope is version 2 and signed; the key is made once and survives a restart", async () => {
+  const { st, b, l, later } = await setup();
+  assert.equal(await sealedOk(l, b, keyFor(1, G, "request")), true);
+  const pub = (await l.status(NOW)).public_key;
+  // A new Ledger over the same storage (a Durable Object restart) signs with the same key.
+  const again = new Ledger(st, b);
+  assert.equal((await again.status(NOW)).public_key, pub);
+  assert.equal((await again.accept(later("approval"), at(1))).status, 201);
+  assert.equal(await sealedOk(l, b, keyFor(2, G, "approval")), true);
+});
+
+test("T10: a record stored late is signed again over the time it was actually stored", async () => {
+  const { b, l, later } = await setup();
+  b.failNext();
+  assert.equal((await l.accept(later("approval"), at(1))).status, 503);
+  assert.equal((await l.accept(later("verdict"), at(20))).status, 201); // finishes the pending approval first
+  const x = JSON.parse(b.store.get(keyFor(2, G, "approval"))!.body) as Envelope;
+  assert.equal(x.recorded_at, at(20)().toISOString());
+  assert.equal(await sealedOk(l, b, keyFor(2, G, "approval")), true);
+});
+
+test("T11: status shows only the 32-byte public key; nothing in it imports as a private key", async () => {
+  const st = storage(), l = new Ledger(st, bucket());
+  const s = await l.status(NOW); // made on first status, before any record
+  assert.equal(unb64(s.public_key).length, 32);
+  for (const v of Object.values(s)) {
+    if (typeof v !== "string") continue;
+    await assert.rejects(crypto.subtle.importKey("pkcs8", unb64(v), "Ed25519", false, ["sign"]));
+  }
+  assert.ok(st.m.has("signing")); // the private half stays in the Durable Object's storage
 });
