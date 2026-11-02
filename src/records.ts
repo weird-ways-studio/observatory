@@ -205,20 +205,26 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // Numbers from the pin's start that were read before this pin took effect: each is checked once
   // for exactly one signed copy, without counting it again (Codex r1 #2).
   let sealedTo = key && prev.sealed?.key === pin!.key && Number.isInteger(prev.sealed.to) ? prev.sealed.to : from - 1;
+  let sealDone = !key;
   try {
     if (key && env.RECORDS && verdict === "healthy") {
       while (sealedTo < seq && checked < PAGE) {
         const n = sealedTo + 1, here = await namesAt(env.RECORDS, `${ROOT}${pad(n)}.`);
+        for (const k of here.junk) findings.push(await stray(k));
         if (here.capped || here.cands.length > MAX_COPIES) throw new Error("too many");
         const s = await sealsAt(env.RECORDS, key, n, here.cands);
         if (s.unreadable) throw new Error("unreadable");
-        if (s.seals.length > 1) findings.push(forged(n, s.seals.length));
-        else if (!s.seals.length) findings.push({ id: `unsigned:${n}`, text: `record ${n} was read before the key was pinned and has no copy the recorder signed` });
+        findings.push(...s.foreign);
+        if (s.seals.length > 1) {
+          findings.push(forged(n, s.seals.length));
+          throw new Error("forged"); // stays at n, like the main read
+        } else if (!s.seals.length) findings.push({ id: `unsigned:${n}`, text: `record ${n} was read before the key was pinned and has no copy the recorder signed` });
         sealedTo = n;
         checked++;
       }
       if (sealedTo < seq) throw new Error("not done");
     }
+    sealDone = true;
   } catch {
     verdict = "unverified";
     reason = `records read before the key was pinned are still being checked for signatures (up to ${sealedTo})`;
@@ -322,7 +328,9 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   }
   for (const [d, n] of Object.entries(days)) if (n > DAY_CAP) findings.push({ id: `cap:${d}`, text: `${n} records stored on ${d}, over the cap of ${DAY_CAP}` });
   findings.push(...swept);
-  if (key) sealedTo = Math.max(sealedTo, seq);
+  // Only numbers the main read itself checked under the key join the signed range; never after a
+  // re-check that stopped short (it would mark unchecked numbers as signed).
+  if (key && sealDone) sealedTo = Math.max(sealedTo, seq);
   // Forget grants past their life, keeping at most MAX_OPEN, and day counts older than three days.
   for (const [g, o] of Object.entries(open)) if (now.getTime() - o.at > GRANT_TTL_MS + 86_400_000) delete open[g];
   for (const g of Object.keys(open).sort((a, b) => open[a].at - open[b].at).slice(0, Math.max(0, Object.keys(open).length - MAX_OPEN))) delete open[g];

@@ -346,6 +346,42 @@ test("T9: a pin that cannot be read is unverified, never a crash, and reads noth
   }
 });
 
+test("security review: a re-check that stops short never marks unchecked numbers as signed, and keeps its findings", async () => {
+  const b = bucket(), e = env(b), real = new Ledger(memory(), b);
+  for (let n = 1; n <= 3; n++) await planted(b, n, `grant-pre${String(n).padStart(4, "0")}`, "request", at(-9)); // read unsigned
+  assert.equal((await runRecords(e, wire().fetch, NOW, undefined)).seq, 3);
+  b.unreadable.add(keyFor(2, "grant-pre0002", "request"));
+  b.add("records/v1/000000000001.junk", "{}", at(-8));
+  const pin = await pinOf(real);
+  const r = await runRecords(e, wire().fetch, at(60), pin);
+  assert.equal(r.records, "unverified");
+  assert.match(r.reason, /still being checked for signatures \(up to 1\)/);
+  const st = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
+  const found = [...(st.alerted as string[]), ...(st.queued as { id: string }[]).map((f) => f.id)];
+  assert.ok(found.some((id) => id.startsWith("foreign:1:")), found.join()); // foreign copies reported here too
+  assert.ok(found.some((id) => id.startsWith("stray:")), found.join()); // and junk names
+  assert.equal(st.sealed.to, 1); // not 3
+  b.unreadable.clear();
+  const next = await runRecords(e, wire().fetch, at(120), pin);
+  assert.match(next.reason, /record 2 was read before the key was pinned/);
+  assert.match(next.reason, /record 3 was read before the key was pinned/);
+});
+
+test("security review: two signed copies found by the re-check stop it there, unverified", async () => {
+  const pair = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+  const pin = { key: b64((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer), from: 1 };
+  const b = bucket(), e = env(b);
+  for (const g of ["grant-sign-a", "grant-sign-b"]) {
+    const body = rec("request", {}, g);
+    const x: Envelope = { v: 2, seq: 1, grant: g, stage: "request", recorded_at: at(-5).toISOString(), sha256: await sha256(body), body };
+    b.add(keyFor(1, g, "request"), JSON.stringify({ ...x, sig: b64(await crypto.subtle.sign("Ed25519", pair.privateKey, sealed(x))) }), at(-5));
+  }
+  await runRecords(e, wire().fetch, NOW, undefined); // read unsigned past number 1
+  const r = await runRecords(e, wire().fetch, at(60), pin);
+  assert.equal(r.records, "unverified");
+  assert.equal(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).sealed.to, 0);
+});
+
 test("T13 (Codex r1 #1): a number the old checker held and passed is read again from its saved bookkeeping, never skipped", async () => {
   const b = bucket(), e = env(b), l = await viaRecorder(b, [G], -10, ["request", "approval"]);
   await planted(b, 2, "grant-plant-a", "request", at(-5));
