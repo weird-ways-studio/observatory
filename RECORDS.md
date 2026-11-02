@@ -13,7 +13,7 @@ definition of the format: `src/contract.ts`.
 
 Cloudflare Access stands in front of the address and lets through only the front desk's service
 token and Ben. The recorder checks Access's signed token again itself. `GET /v1/status` (front desk
-or Ben) shows today's count and whether a write is pending. Nothing else answers.
+or Ben) shows today's count, whether a write is pending, and the recorder's public key. Nothing else answers.
 
 ## The record
 
@@ -64,23 +64,37 @@ overwrite or delete of a locked object.
 The recorder picks every name: numbers start at 1 with no gaps, so sorting by name is the order
 it accepted them. Each object holds an envelope, with the writer's bytes untouched:
 
-    { "v": 1, "seq": 42, "grant": "...", "stage": "...", "recorded_at": "<recorder's time>",
-      "sha256": "<hex of body>", "body": "<the writer's record, as sent>" }
+    { "v": 2, "seq": 42, "grant": "...", "stage": "...", "recorded_at": "<recorder's time>",
+      "sha256": "<hex of body>", "body": "<the writer's record, as sent>", "sig": "<base64>" }
+
+`sig` is the recorder's Ed25519 signature over the JSON of the other fields in that order
+(`sealed` in `src/contract.ts`). The key is made inside the recorder's Durable Object on first use
+(a record or a status read); its private half stays in that object's storage and is never returned
+or logged. Records stored before signing began are version 1, with no `sig`.
+
+## Pinning the recorder's key (Ben's step)
+
+The checker trusts one public key, written into `PIN` in `src/records.ts` by a PR Ben merges:
+`{ key: "<public_key from GET /v1/status>", from: <the first record number that must be signed> }`.
+Until then the checker reads as it did before signing, except that a shared number is only a
+finding. When a pin first takes effect, every number from `from` that was already read is checked
+once for exactly one signed copy (an `unsigned` finding otherwise), without being counted again; the
+run stays unverified until that check has caught up. A lost or replaced key makes every later record foreign, loudly, until Ben merges the
+new key.
 
 ## What the Observatory checks every hour
 
 Every record stored since its last run, asking for the next expected number by name each time,
 so names elsewhere in the bucket cost nothing and cannot hide records still to come (at most 500
-an hour; more is itself a finding). Two objects with one number: the checker cannot tell which copy
-is the recorder's (by design it cannot read the recorder's ledger), so the number is held. Reading
-goes on past it; every copy at a held number is re-checked every hour, so the recorder's own is
-checked whenever it lands; none counts toward a grant or a day; and the run stays unverified until
-Ben names the copy he trusts in the `RECORDS_HELD_ACK` setting, as `<number>:<grant>.<stage>`
-(comma-separated), earliest held number first. The checker then rewinds to just before that number
-(it saved its bookkeeping there) and reads on in order with Ben's copy as that number's record, so
-the order and day checks come out as if it had been the only one (nothing is tidied away until the
-replay is back where it was). At most 20 numbers are held; the
-21st stops the read, unverified. A missing number with a
+an hour; more is itself a finding). From `PIN.from` on, the record at a number is the one copy whose
+signature the pinned key verifies and whose envelope names that same number, grant and stage; every
+other object there is a foreign finding, and reading goes on with no step for Ben (the recorder
+itself still stops, 503, while something else sits under its next number). With no signed
+copy at a number yet, the bookmark waits there and reads it again next hour. Two signed copies at
+one number mean the key may be stolen: a `forged` finding, ranked first, and the read stops there,
+unverified. More than 20 objects at one number, or one that cannot be read, also leaves the run
+unverified with the bookmark in place. Before the pin, two objects with one number are a finding
+and none of them counts. A missing number with a
 higher one present is a standing gap finding. For each record: the name, the size, the envelope against the name and R2's upload time (within
 10 minutes), the hash, the record against this contract, and the order of each grant's stages
 (no duplicates, request first, approval before result, same request and job). Also: any gap in

@@ -1,6 +1,6 @@
 // The recorder's address, request by request (card feea07eb, route A). Two paths, nothing else:
 //   POST /v1/records  the front desk's service token only: one record in, one receipt out
-//   GET  /v1/status   the front desk or Ben: today's count and whether a write is pending
+//   GET  /v1/status   the front desk or Ben: today's count, whether a write is pending, and the public key the checker pins
 // Every request passes the edge-login check (access.ts) before anything else runs, including
 // reading the body; the body is read only up to the size limit.
 import { MAX_RECORD_BYTES } from "../contract.ts";

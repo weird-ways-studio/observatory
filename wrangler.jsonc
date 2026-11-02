@@ -9,7 +9,7 @@
 // PUSHOVER_TOKEN, PUSHOVER_USER, for the hourly freshness check (card f0d4e2fc) PING_URL_FRESH,
 // and for the nightly lock-length check (src/lock.ts) LOCK_READ_TOKEN, LOCK_ACCOUNT_ID.
 // Phase 2a (card feea07eb, route A): RECORDS -> observatory-records, written only by the recorder Worker (wrangler.recorder.jsonc), read
-// hourly by src/records.ts, which reports to its own check PING_URL_RECORDS (a secret); RECORDS_HELD_ACK names, per held record number, the copy Ben trusts.
+// hourly by src/records.ts, which reports to its own check PING_URL_RECORDS (a secret). The recorder's public key is pinned in src/records.ts (PIN), never a setting.
 // Wrangler deploys never delete them. DEPLOYED_SHA comes from the deploy command (--var), not here.
 // test/config.test.ts fails if any of that changes; widen it only in a reviewed PR.
 // Comments here stay on their own lines: the test reads this file as JSON after dropping them.

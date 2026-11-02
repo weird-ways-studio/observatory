@@ -2,9 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/index.ts";
 import { FRESH_CRON } from "../src/fresh.ts";
-import { DAY_CAP, keyFor, MAX_STORED_BYTES, sha256, type Stage } from "../src/contract.ts";
+import { b64, DAY_CAP, keyFor, MAX_STORED_BYTES, sealed, sha256, type Envelope, type Stage } from "../src/contract.ts";
 import { Ledger, type Storage } from "../src/recorder/ledger.ts";
-import { fp, MAX_QUEUED, MIN_LOCK_SECONDS, PAGE, runRecords, STATE_KEY, SWEEP_HOUR, type RecordsEnv } from "../src/records.ts";
+import { fp, MAX_COPIES, MAX_QUEUED, MIN_LOCK_SECONDS, PAGE, runRecords, STATE_KEY, SWEEP_HOUR, type Pin, type RecordsEnv } from "../src/records.ts";
 /** A finding line for a grant, as alerts show it: the fingerprint, never the id. */
 const says = async (grant: string, rest: string, n = "\\d+") => new RegExp(`grant ${await fp(grant)} \\(record ${n}\\)${rest}`);
 
@@ -69,6 +69,8 @@ async function viaRecorder(b: B, grants = [G], start = -10, stages: Stage[] = ["
   }
   return l;
 }
+/** The pin Ben would merge: the recorder's public key from its status, signed from record `from` on. */
+const pinOf = async (l: Ledger, from = 1): Promise<Pin> => ({ key: (await l.status(NOW)).public_key, from });
 /** A record placed straight into the bucket, as something around the recorder would. */
 async function planted(b: B, seq: number, grant: string, stage: Stage, uploaded: Date, over: { body?: string; envelope?: object; request?: string } = {}) {
   const body = over.body ?? rec(stage, stage === "request" ? {} : { request: over.request ?? "a".repeat(64) }, grant);
@@ -201,90 +203,243 @@ test("security review: a stray name that sorts after every record is reported ea
   assert.match(second.reason, /something outside the record format/);
 });
 
-test("security review: a shared number is held -- reading goes on, every copy is re-checked hourly, days are not inflated, and Ben clears it by naming the trusted copy", async () => {
+test("before a pin: a shared number is a finding, none of its copies counts, and reading goes on with no step for Ben", async () => {
   const b = bucket(), e = env(b), l = new Ledger(memory(), b);
   const req = rec("request"), h = await sha256(req);
   b.setClock(at(-10)); await l.accept(req, () => at(-10));
   b.setClock(at(-9)); await l.accept(rec("approval", { request: h }), () => at(-9)); // the recorder's number 2
-  // Planted at number 2 after the recorder wrote it (the recorder refuses a number already taken).
   await planted(b, 2, "grant-plant-a", "request", at(-8));
-  await planted(b, 2, "grant-plant-b", "request", at(-8), { envelope: { sha256: "0".repeat(64) } });
-  const first = await runRecords(e, wire().fetch, NOW);
-  assert.deepEqual([first.records, first.seq], ["unverified", 2]);
-  assert.match(first.reason, /record number 2 held \(shared by several objects\): reading goes on, but the run stays unverified until Ben names the copy he trusts in RECORDS_HELD_ACK/);
-  b.setClock(at(1)); await l.accept(rec("verdict", { request: h }), () => at(1)); // number 3, read normally
+  b.setClock(at(-7)); await l.accept(rec("verdict", { request: h }), () => at(-7)); // number 3
+  const r = await runRecords(e, wire().fetch, NOW, undefined);
+  assert.deepEqual([r.records, r.seq, r.checked], ["findings", 3, 3]);
+  assert.match(r.reason, /2 objects share record number 2, from before records were signed: none counts/);
+  assert.equal(Object.values(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).days as Record<string, number>).reduce((x, y) => x + y, 0), 2);
+});
+
+test("T1: a planted copy beside a signed record is foreign; the signed one counts and reading goes on", async () => {
+  const b = bucket(), e = env(b), l = await viaRecorder(b, [G], -10, ["request", "approval"]);
+  await planted(b, 2, "grant-plant-a", "request", at(-5)); // written beside the recorder's number 2
+  await planted(b, 2, G, "verdict", at(-5), { request: await sha256(rec("request")) });
   const w = wire();
-  const second = await runRecords(e, w.fetch, at(60));
-  assert.deepEqual([second.records, second.seq, second.checked], ["unverified", 3, 1]);
+  const r = await runRecords(e, w.fetch, NOW, await pinOf(l));
+  assert.deepEqual([r.records, r.seq, r.checked], ["findings", 2, 2]);
+  assert.equal((r.reason.match(/record 2: an object the recorder did not sign/g) ?? []).length, 2);
+  assert.ok(!/grant-plant-a/.test(r.reason));
   assert.deepEqual(w.hc(), ["/rec/fail"]);
-  const state = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
-  const ids = [...(state.alerted as string[]), ...(state.queued as { id: string }[]).map((f) => f.id)];
-  assert.ok(ids.some((id) => id.startsWith("bad:2:") && id.endsWith("grant-plant-b.request")), ids.join(","));
-  assert.equal(Object.values(state.days as Record<string, number>).reduce((x, y) => x + y, 0), 2); // records 1 and 3 only
-  // A bare number clears nothing; naming the recorder's copy does, and that copy is then counted.
-  assert.equal((await runRecords({ ...e, RECORDS_HELD_ACK: "2" }, wire().fetch, at(120))).records, "unverified");
-  const ack = { ...e, RECORDS_HELD_ACK: " 2:grant-0001.approval " };
-  const done = await runRecords(ack, wire().fetch, at(180));
-  assert.equal(done.records, "findings"); // the planted broken copy is reported one last time
-  assert.equal((await runRecords(ack, wire().fetch, at(240))).records, "healthy");
-  assert.equal(Object.values(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).days as Record<string, number>).reduce((x, y) => x + y, 0), 3);
+  // The recorder's own record counted in order: its result is not "unapproved".
+  const h = await sha256(rec("request"));
+  b.setClock(at(1)); await l.accept(rec("result", { request: h }), () => at(1));
+  const next = await runRecords(e, wire().fetch, at(60), await pinOf(l));
+  assert.equal(next.seq, 3);
+  assert.ok(!/unapproved|no approval/.test(next.reason), next.reason);
 });
 
-test("Codex r3: a cleared held copy is checked in its place in the order, not after later records", async () => {
-  const b = bucket(), e = env(b), req = rec("request"), h = await sha256(req);
-  await planted(b, 1, G, "request", at(-10));
-  await planted(b, 2, G, "result", at(-9), { request: h }); // the result, before any approval
-  await planted(b, 2, "grant-plant-z", "request", at(-9));
-  await planted(b, 3, G, "approval", at(-8), { request: h });
-  assert.equal((await runRecords(e, wire().fetch, NOW)).records, "unverified");
-  const r = await runRecords({ ...e, RECORDS_HELD_ACK: "2:grant-0001.result" }, wire().fetch, at(60));
-  assert.notEqual(r.records, "healthy");
-  assert.match(r.reason, await says(G, " has a result with no approval record before it", "2"));
+test("T2: a signed envelope copied to another number or name is foreign", async () => {
+  const b = bucket(), l = await viaRecorder(b, [G], -10, ["request"]);
+  const real = b.store.get(keyFor(1, G, "request"))!.body;
+  b.add(keyFor(2, G, "request"), real, at(-5)); // same envelope, next number
+  b.add(keyFor(3, "grant-other", "request"), real, at(-5)); // a later number under another grant
+  const r = await runRecords(env(b), wire().fetch, NOW, await pinOf(l));
+  assert.deepEqual([r.seq, r.checked], [1, 1]);
+  assert.match(r.reason, /record 2: an object the recorder did not sign/);
+  // And moved under another grant at its own number, it is foreign there too.
+  const b2 = bucket(), l2 = await viaRecorder(b2, [G], -10, ["request"]);
+  const moved = JSON.parse(b2.store.get(keyFor(1, G, "request"))!.body);
+  b2.store.delete(keyFor(1, G, "request"));
+  b2.add(keyFor(1, "grant-other", "request"), JSON.stringify({ ...moved, grant: "grant-other" }), at(-5));
+  const r2 = await runRecords(env(b2), wire().fetch, NOW, await pinOf(l2));
+  assert.deepEqual([r2.seq, r2.records], [0, "findings"]);
+  assert.match(r2.reason, /record 1: an object the recorder did not sign/);
 });
 
-test("Codex r3: clearing a hold days later still counts its day against the cap", async () => {
-  const b = bucket(), e = env(b), nov1 = new Date("2026-11-01T10:00:00Z");
-  for (let n = 1; n <= DAY_CAP; n++) await planted(b, n, `grant-d${String(n).padStart(4, "0")}`, "request", nov1);
-  await planted(b, DAY_CAP + 1, "grant-held-a", "request", nov1);
-  await planted(b, DAY_CAP + 1, "grant-held-b", "request", nov1);
-  await runRecords(e, wire().fetch, new Date("2026-11-01T12:30:00Z"));
-  await runRecords(e, wire().fetch, new Date("2026-11-05T12:30:00Z")); // the Nov 1 day count is pruned by now
-  const r = await runRecords({ ...e, RECORDS_HELD_ACK: `${DAY_CAP + 1}:grant-held-a.request` }, wire().fetch, new Date("2026-11-05T13:30:00Z"));
-  assert.match(r.reason, new RegExp(`${DAY_CAP + 1} records stored on 2026-11-01, over the cap of ${DAY_CAP}`));
+test("T3: editing any signed field breaks the signature", async () => {
+  for (const edit of [
+    async (x: Envelope) => { x.body = rec("request", { extra: 1 }); x.sha256 = await sha256(x.body); },
+    async (x: Envelope) => { x.recorded_at = at(-4).toISOString(); },
+    async (x: Envelope) => { x.sha256 = "0".repeat(64); },
+  ]) {
+    const b = bucket(), l = await viaRecorder(b, [G], -10, ["request"]);
+    const x = JSON.parse(b.store.get(keyFor(1, G, "request"))!.body) as Envelope;
+    await edit(x);
+    b.store.set(keyFor(1, G, "request"), { ...b.store.get(keyFor(1, G, "request"))!, body: JSON.stringify(x) });
+    const r = await runRecords(env(b), wire().fetch, NOW, await pinOf(l));
+    assert.deepEqual([r.seq, r.checked], [0, 0]);
+    assert.match(r.reason, /record 1: an object the recorder did not sign/);
+  }
 });
 
-test("Codex r4: a replay longer than one hour's page keeps its bookkeeping until it catches up", async () => {
-  // Request #1, held approval #2 (two copies), 499 other requests, then the grant's result at #502.
-  const b = bucket(), e = env(b), req = rec("request"), h = await sha256(req), t0 = new Date("2026-11-01T10:00:00Z");
-  await planted(b, 1, G, "request", t0);
-  await planted(b, 2, G, "approval", t0, { request: h });
-  await planted(b, 2, "grant-plant-q", "request", t0);
-  for (let n = 3; n <= 501; n++) await planted(b, n, `grant-f${String(n).padStart(4, "0")}`, "request", n <= 401 ? t0 : new Date("2026-11-02T10:00:00Z"));
-  await planted(b, 502, G, "result", new Date("2026-11-02T10:00:00Z"), { request: h });
-  for (const hr of [0, 1]) await runRecords(e, wire().fetch, new Date(`2026-11-02T1${hr}:30:00Z`)); // read through, #2 held
-  // Cleared days later: the replay takes two hours' pages and must not forget the request or Nov 1's count.
-  const ack = { ...e, RECORDS_HELD_ACK: "2:grant-0001.approval" };
-  const one = await runRecords(ack, wire().fetch, new Date("2026-11-06T10:30:00Z"));
-  const two = await runRecords(ack, wire().fetch, new Date("2026-11-06T11:30:00Z"));
-  assert.equal(two.seq, 502);
-  const all = `${one.reason}; ${two.reason}`;
-  assert.ok(!/result with no request record/.test(all), all);
-  assert.match(all, new RegExp(`401 records stored on 2026-11-01, over the cap of ${DAY_CAP}`));
+test("T4 and T8: no signed copy at a number keeps the bookmark there; the real record is read when it lands; a wrong key reads nothing", async () => {
+  const b = bucket(), e = env(b), real = bucket(), l = await viaRecorder(real, [G], -10, ["request"]), pin = await pinOf(l);
+  await planted(b, 1, "grant-plant-a", "request", at(-12)); // ahead of the recorder
+  // Today the recorder itself stops rather than write beside it (RECORDS.md, 503).
+  assert.equal((await new Ledger(memory(), b).accept(rec("request"), () => at(-11))).status, 503);
+  const first = await runRecords(e, wire().fetch, NOW, pin);
+  assert.deepEqual([first.records, first.seq, first.checked], ["findings", 0, 0]);
+  // The recorder's own record arrives beside it (a different name): read in its place.
+  const k = keyFor(1, G, "request");
+  b.add(k, real.store.get(k)!.body, real.store.get(k)!.uploaded);
+  const second = await runRecords(e, wire().fetch, at(60), pin);
+  assert.deepEqual([second.seq, second.checked], [1, 1]);
+  // A replaced key (T8): every record is foreign until Ben pins the new one -- loud, never passed.
+  const other = await pinOf(new Ledger(memory(), bucket()));
+  const r = await runRecords(env(real), wire().fetch, NOW, other);
+  assert.deepEqual([r.records, r.seq], ["findings", 0]);
+  assert.match(r.reason, /record 1: an object the recorder did not sign/);
 });
 
-test("security review: junk names under a number cannot hide its real record, and at most 20 numbers are held", async () => {
+test("T5: more than MAX_COPIES objects at one number is unverified; nothing there counts and the bookmark waits", async () => {
+  const b = bucket(), l = await viaRecorder(b, [G], -10, ["request"]);
+  for (let n = 0; n < MAX_COPIES; n++) await planted(b, 1, `grant-flood${String(n).padStart(4, "0")}`, "request", at(-5));
+  const r = await runRecords(env(b), wire().fetch, NOW, await pinOf(l));
+  assert.deepEqual([r.records, r.seq, r.checked], ["unverified", 0, 0]);
+  assert.match(r.reason, new RegExp(`${MAX_COPIES + 1} objects share record number 1, over ${MAX_COPIES}`));
+});
+
+test("T6: after the cutover an unsigned or stripped envelope is foreign; before it, the old record still reads", async () => {
+  const b = bucket(), e = env(b), l = new Ledger(memory(), b);
+  await planted(b, 1, G, "request", at(-20)); // stored before signing began
+  await planted(b, 2, "grant-v1", "request", at(-10)); // unsigned, after the cutover
+  const r = await runRecords(e, wire().fetch, NOW, { ...(await pinOf(l)), from: 2 });
+  assert.deepEqual([r.seq, r.checked], [1, 1]);
+  assert.match(r.reason, /record 2: an object the recorder did not sign/);
+  // A real signed record with its signature removed, or downgraded to version 1.
+  for (const strip of [(x: Envelope) => { delete x.sig; }, (x: Envelope) => { x.v = 1; }]) {
+    const b2 = bucket(), l2 = await viaRecorder(b2, [G], -10, ["request"]), k = keyFor(1, G, "request");
+    const x = JSON.parse(b2.store.get(k)!.body) as Envelope;
+    strip(x);
+    b2.store.set(k, { ...b2.store.get(k)!, body: JSON.stringify(x) });
+    const r2 = await runRecords(env(b2), wire().fetch, NOW, await pinOf(l2));
+    assert.deepEqual([r2.seq, r2.records], [0, "findings"]);
+  }
+});
+
+test("T7: two signed copies at one number mean the key may be stolen: unverified, neither counts", async () => {
+  const pair = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+  const pin = { key: b64((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer), from: 1 };
+  const b = bucket();
+  for (const g of ["grant-sign-a", "grant-sign-b"]) {
+    const body = rec("request", {}, g);
+    const x: Envelope = { v: 2, seq: 1, grant: g, stage: "request", recorded_at: at(-5).toISOString(), sha256: await sha256(body), body };
+    b.add(keyFor(1, g, "request"), JSON.stringify({ ...x, sig: b64(await crypto.subtle.sign("Ed25519", pair.privateKey, sealed(x))) }), at(-5));
+  }
+  const r = await runRecords(env(b), wire().fetch, NOW, pin);
+  assert.deepEqual([r.records, r.seq, r.checked], ["unverified", 0, 0]);
+  assert.match(r.reason, /record 1 has 2 signed copies/);
+});
+
+test("T7: a copy that cannot be read beside a signed record could be a second signature: unverified, the bookmark waits", async () => {
+  const b = bucket(), l = await viaRecorder(b, [G], -10, ["request"]);
+  await planted(b, 1, "grant-plant-u", "request", at(-5));
+  b.unreadable.add(keyFor(1, "grant-plant-u", "request"));
+  const r = await runRecords(env(b), wire().fetch, NOW, await pinOf(l));
+  assert.deepEqual([r.records, r.seq, r.checked], ["unverified", 0, 0]);
+  assert.match(r.reason, /record 1 could not be read/);
+});
+
+test("T9: a pin that cannot be read is unverified, never a crash, and reads nothing", async () => {
+  const b = bucket();
+  await viaRecorder(b, [G], -10, ["request"]);
+  for (const pin of [{ key: "not base64!", from: 1 }, { key: b64(new Uint8Array(5)), from: 1 }, { key: (await pinOf(new Ledger(memory(), bucket()))).key, from: 0 }]) {
+    const r = await runRecords(env(b), wire().fetch, NOW, pin);
+    assert.deepEqual([r.records, r.seq, r.checked], ["unverified", 0, 0]);
+    assert.match(r.reason, /the pinned recorder key could not be read/);
+  }
+});
+
+test("security review: a re-check that stops short never marks unchecked numbers as signed, and keeps its findings", async () => {
+  const b = bucket(), e = env(b), real = new Ledger(memory(), b);
+  for (let n = 1; n <= 3; n++) await planted(b, n, `grant-pre${String(n).padStart(4, "0")}`, "request", at(-9)); // read unsigned
+  assert.equal((await runRecords(e, wire().fetch, NOW, undefined)).seq, 3);
+  b.unreadable.add(keyFor(2, "grant-pre0002", "request"));
+  b.add("records/v1/000000000001.junk", "{}", at(-8));
+  const pin = await pinOf(real);
+  const r = await runRecords(e, wire().fetch, at(60), pin);
+  assert.equal(r.records, "unverified");
+  assert.match(r.reason, /still being checked for signatures \(up to 1\)/);
+  const st = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
+  const found = [...(st.alerted as string[]), ...(st.queued as { id: string }[]).map((f) => f.id)];
+  assert.ok(found.some((id) => id.startsWith("foreign:1:")), found.join()); // foreign copies reported here too
+  assert.ok(found.some((id) => id.startsWith("stray:")), found.join()); // and junk names
+  assert.equal(st.sealed.to, 1); // not 3
+  b.unreadable.clear();
+  const next = await runRecords(e, wire().fetch, at(120), pin);
+  assert.match(next.reason, /record 2 was read before the key was pinned/);
+  assert.match(next.reason, /record 3 was read before the key was pinned/);
+});
+
+test("Codex r2 #2: a re-check longer than one hour's budget picks up where it stopped and never skips the last number", async () => {
+  const pair = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+  const pin = { key: b64((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer), from: 1 };
+  const b = bucket(), e = env(b), t0 = new Date("2026-11-01T10:00:00Z");
+  for (let n = 1; n <= PAGE; n++) {
+    const g = `grant-s${String(n).padStart(4, "0")}`, body = rec("request", {}, g);
+    const x: Envelope = { v: 2, seq: n, grant: g, stage: "request", recorded_at: t0.toISOString(), sha256: await sha256(body), body };
+    b.add(keyFor(n, g, "request"), JSON.stringify({ ...x, sig: b64(await crypto.subtle.sign("Ed25519", pair.privateKey, sealed(x))) }), t0);
+  }
+  await planted(b, PAGE + 1, "grant-unsig", "request", t0); // the last one, unsigned
+  for (const h of [0, 1]) await runRecords(e, wire().fetch, new Date(`2026-11-01T1${h}:30:00Z`), undefined); // read through unsigned
+  const one = await runRecords(e, wire().fetch, new Date("2026-11-01T12:30:00Z"), pin);
+  assert.equal(one.records, "unverified");
+  assert.equal(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).sealed.to, PAGE);
+  const two = await runRecords(e, wire().fetch, new Date("2026-11-01T13:30:00Z"), pin);
+  assert.notEqual(two.records, "healthy");
+  assert.match(two.reason, new RegExp(`record ${PAGE + 1} was read before the key was pinned`));
+});
+
+test("security review: two signed copies found by the re-check stop it there, unverified", async () => {
+  const pair = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+  const pin = { key: b64((await crypto.subtle.exportKey("raw", pair.publicKey)) as ArrayBuffer), from: 1 };
+  const b = bucket(), e = env(b);
+  for (const g of ["grant-sign-a", "grant-sign-b"]) {
+    const body = rec("request", {}, g);
+    const x: Envelope = { v: 2, seq: 1, grant: g, stage: "request", recorded_at: at(-5).toISOString(), sha256: await sha256(body), body };
+    b.add(keyFor(1, g, "request"), JSON.stringify({ ...x, sig: b64(await crypto.subtle.sign("Ed25519", pair.privateKey, sealed(x))) }), at(-5));
+  }
+  await runRecords(e, wire().fetch, NOW, undefined); // read unsigned past number 1
+  const r = await runRecords(e, wire().fetch, at(60), pin);
+  assert.equal(r.records, "unverified");
+  assert.equal(JSON.parse(e.COPY.store.get(STATE_KEY)!.body).sealed.to, 0);
+});
+
+test("T13 (Codex r1 #1): a number the old checker held and passed is read again from its saved bookkeeping, never skipped", async () => {
+  const b = bucket(), e = env(b), l = await viaRecorder(b, [G], -10, ["request", "approval"]);
+  await planted(b, 2, "grant-plant-a", "request", at(-5));
+  // What the old checker saved: bookmark past the held number 2, snapshot taken just before it.
+  await e.COPY.put(STATE_KEY, JSON.stringify({ seq: 2, held: [2], snap: { seq: 1, open: { [G]: { job: "cf.token.canary", req: "x", at: at(-10).getTime(), stages: ["request"] } }, days: { "2026-11-01": 1 } }, open: {}, days: {} }));
+  const r = await runRecords(e, wire().fetch, NOW, await pinOf(l));
+  // Number 1 gets its one signature check (new pin), then number 2 is read in its place and counted.
+  assert.deepEqual([r.seq, r.checked], [2, 2]);
+  const saved = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
+  assert.deepEqual(["held", "snap", "replayTo"].filter((k) => k in saved), []);
+  assert.equal(saved.days["2026-11-01"], 2);
+});
+
+test("Codex r1 #2: when the pin arrives after records were read unsigned, each is checked once for a signature and not counted again", async () => {
+  const b = bucket(), e = env(b), real = new Ledger(memory(), b);
+  b.setClock(at(-10)); await real.accept(rec("request"), () => at(-10)); // number 1, signed
+  await planted(b, 2, "grant-plant-u", "request", at(-9)); // number 2, unsigned, read before any pin
+  assert.equal((await runRecords(e, wire().fetch, NOW, undefined)).seq, 2);
+  const r = await runRecords(e, wire().fetch, at(60), await pinOf(real));
+  assert.equal(r.seq, 2);
+  assert.match(r.reason, /record 2 was read before the key was pinned and has no copy the recorder signed/);
+  assert.ok(!/record 1 was read/.test(r.reason));
+  const saved = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
+  assert.equal(saved.sealed.to, 2);
+  assert.equal(Object.values(saved.days as Record<string, number>).reduce((x, y) => x + y, 0), 2); // not counted twice
+  // Once checked, later hours do not check them again.
+  const again = await runRecords(e, wire().fetch, at(120), await pinOf(real));
+  assert.equal(again.checked, 0);
+});
+
+test("security review: junk names under a number cannot hide its real record", async () => {
   const b = bucket(), l = new Ledger(memory(), b);
   b.setClock(at(-10)); await l.accept(rec("request"), () => at(-10));
   for (const j of ["a", "aa", "aaa", "b"]) b.add(`records/v1/000000000001.${j}`, "{}", at(-9)); // junk sorting before it
-  const r = await runRecords(env(b), wire().fetch, NOW);
-  assert.deepEqual([r.checked, r.seq], [1, 1]);
-  assert.match(r.reason, /something outside the record format/);
-  // 21 shared numbers in a row: the 21st stops the read, unverified.
-  const b2 = bucket();
-  for (let n = 1; n <= 21; n++) { await planted(b2, n, `grant-x${String(n).padStart(4, "0")}`, "request", at(-5)); await planted(b2, n, `grant-y${String(n).padStart(4, "0")}`, "request", at(-5)); }
-  const r2 = await runRecords(env(b2), wire().fetch, NOW);
-  assert.equal(r2.seq, 20);
-  assert.match(r2.reason, /20 record numbers are already held: reading stopped at 21 until Ben clears some/);
+  for (const pin of [undefined, await pinOf(l)]) {
+    const r = await runRecords(env(b), wire().fetch, NOW, pin);
+    assert.deepEqual([r.checked, r.seq], [1, 1]);
+    assert.match(r.reason, /something outside the record format/);
+  }
 });
 
 test("Codex r1 B8: grant ids never appear in alert text, only their fingerprints", async () => {

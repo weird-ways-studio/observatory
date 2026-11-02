@@ -4,8 +4,9 @@
 // its grant, is there room today and in the storage budget. Then it saves the record as pending,
 // writes it to the locked bucket, and only then answers with a receipt. A crash between those
 // steps leaves the pending record, which the next call finishes first -- so sequence numbers never
-// have gaps.
-import { DAY_CAP, GRANT_TTL_MS, keyFor, MAX_STORED_BYTES, sha256, SKEW_MS, STAGE_SLOTS, STORE_BUDGET_BYTES, validate, type Envelope, type Receipt, type Stage } from "../contract.ts";
+// have gaps. Every envelope is signed (card 6a04908f) with a key made here on first use; the
+// private half lives only in this Durable Object's storage and is never returned or logged.
+import { b64, DAY_CAP, GRANT_TTL_MS, keyFor, MAX_STORED_BYTES, sealed, sha256, SKEW_MS, STAGE_SLOTS, STORE_BUDGET_BYTES, unb64, validate, type Envelope, type Receipt, type Stage } from "../contract.ts";
 
 /** The slice of Durable Object storage used here; each put of several keys is one atomic write. */
 export interface Storage {
@@ -22,6 +23,7 @@ interface Open { grant: string; opened: number; left: number }
 interface Meta { seq: number; day: string; used: number; bytes: number; open: Open[] }
 interface Grant { job: string; request: string; opened: number; stages: Partial<Record<Stage, Receipt>> }
 interface Pending { key: string; stored: string; storedSha: string; receipt: Receipt; day: string } // `day`: the UTC day its slot was charged to
+interface Keys { priv: string; pub: string } // base64 PKCS#8 and raw Ed25519 public key
 
 export type Outcome =
   | { status: 200 | 201; receipt: Receipt }
@@ -40,6 +42,7 @@ function rollover(m: Meta, t: number): Meta {
 /** Admits, orders and stores records one at a time; see the file comment. */
 export class Ledger {
   #queue: Promise<unknown> = Promise.resolve();
+  #key?: { priv: CryptoKey; pub: string };
   private storage: Storage;
   private bucket: Bucket;
   private budget: number;
@@ -54,17 +57,47 @@ export class Ledger {
    * time is read when its turn comes, so recorded times rise with sequence numbers.
    */
   accept(body: string, clock: () => Date = () => new Date()): Promise<Outcome> {
-    const run = this.#queue.then(() => this.#accept(body, clock()));
+    return this.#serial(() => this.#accept(body, clock()));
+  }
+
+  /** Runs `fn` after every call queued before it: records, status and key creation never overlap. */
+  #serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(fn);
     this.#queue = run.catch(() => undefined);
     return run;
   }
 
-  /** Today's slot use, the storage budget, and whether a write is pending; nothing writer-chosen. */
-  async status(now: Date) {
-    const stored = await this.storage.get<Meta>("meta");
-    const meta = stored ? rollover(stored, now.getTime()) : undefined;
-    const pending = await this.storage.get<Pending>("pending");
-    return { seq: meta?.seq ?? 0, used_today: meta?.used ?? 0, cap: DAY_CAP, stored_bytes: meta?.bytes ?? 0, budget_bytes: this.budget, pending: Boolean(pending) };
+  /**
+   * Today's slot use, the storage budget, whether a write is pending, and the public key the
+   * checker pins (made here if none exists yet, so it can be pinned before the first record).
+   */
+  status(now: Date) {
+    return this.#serial(async () => {
+      const stored = await this.storage.get<Meta>("meta");
+      const meta = stored ? rollover(stored, now.getTime()) : undefined;
+      const pending = await this.storage.get<Pending>("pending");
+      return { seq: meta?.seq ?? 0, used_today: meta?.used ?? 0, cap: DAY_CAP, stored_bytes: meta?.bytes ?? 0, budget_bytes: this.budget, pending: Boolean(pending), public_key: (await this.#keys()).pub };
+    });
+  }
+
+  /** The signing key: loaded, or made once and kept. Only ever called inside the queue. */
+  async #keys() {
+    if (this.#key) return this.#key;
+    let k = await this.storage.get<Keys>("signing");
+    if (!k) {
+      const made = (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
+      k = { priv: b64((await crypto.subtle.exportKey("pkcs8", made.privateKey)) as ArrayBuffer), pub: b64((await crypto.subtle.exportKey("raw", made.publicKey)) as ArrayBuffer) };
+      await this.storage.put({ signing: k });
+    }
+    this.#key = { priv: await crypto.subtle.importKey("pkcs8", unb64(k.priv), "Ed25519", false, ["sign"]), pub: k.pub };
+    return this.#key;
+  }
+
+  /** The envelope as stored: version 2, signed over every other field. */
+  async #seal(e: Envelope): Promise<string> {
+    const v2: Envelope = { ...e, v: 2 };
+    const sig = await crypto.subtle.sign("Ed25519", (await this.#keys()).priv, sealed(v2));
+    return JSON.stringify({ ...v2, sig: b64(sig) });
   }
 
   /** One record's turn: finish any pending write, check, reserve, queue, store, receipt. */
@@ -104,8 +137,7 @@ export class Ledger {
 
     const seq = meta.seq + 1, key = keyFor(seq, r.grant, r.stage);
     const receipt: Receipt = { v: 1, seq, key, grant: r.grant, stage: r.stage, sha256: sha, recorded_at: now.toISOString() };
-    const envelope: Envelope = { v: 1, seq, grant: r.grant, stage: r.stage, recorded_at: receipt.recorded_at, sha256: sha, body };
-    const stored = JSON.stringify(envelope);
+    const stored = await this.#seal({ v: 2, seq, grant: r.grant, stage: r.stage, recorded_at: receipt.recorded_at, sha256: sha, body });
     const pending: Pending = { key, stored, storedSha: await sha256(stored), receipt, day: meta.day };
     // Counted, ordered and queued in one atomic step, before the bucket is touched.
     await this.storage.put({
@@ -138,7 +170,8 @@ export class Ledger {
           // Stored late (the bucket was down), or on a later UTC day however briefly: no receipt has
           // gone out, so it takes the time it is actually stored, and its receipt says the same.
           const receipt = { ...p.receipt, recorded_at: now.toISOString() };
-          const stored = JSON.stringify({ ...(JSON.parse(p.stored) as Envelope), recorded_at: receipt.recorded_at });
+          // A new time means a new signature: the old one covered the old time.
+          const stored = await this.#seal({ ...(JSON.parse(p.stored) as Envelope), recorded_at: receipt.recorded_at });
           const g = (await this.storage.get<Grant>(`g:${receipt.grant}`))!;
           const writes: Record<string, unknown> = { [`g:${receipt.grant}`]: { ...g, stages: { ...g.stages, [receipt.stage]: receipt } } };
           let charged = p.day;
@@ -153,6 +186,11 @@ export class Ledger {
           p = { ...p, stored, storedSha: await sha256(stored), receipt, day: charged };
           writes.pending = p;
           await this.storage.put(writes);
+        } else if ((JSON.parse(p.stored) as Envelope).v !== 2) {
+          // Queued before this recorder signed records (card 6a04908f): signed now, before it is stored.
+          const stored = await this.#seal(JSON.parse(p.stored) as Envelope);
+          p = { ...p, stored, storedSha: await sha256(stored) };
+          await this.storage.put({ pending: p });
         }
         await this.bucket.put(p.key, p.stored, { customMetadata: { sha256: p.storedSha }, httpMetadata: { contentType: "application/json" } });
       }
