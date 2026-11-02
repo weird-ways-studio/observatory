@@ -453,3 +453,18 @@ test("T11: status shows only the 32-byte public key; nothing in it imports as a 
   }
   assert.ok(st.m.has("signing")); // the private half stays in the Durable Object's storage
 });
+
+test("Codex r1 #3: a write queued by the recorder before signing is signed before it is stored", async () => {
+  const { st, b, l, later } = await setup();
+  b.failNext();
+  assert.equal((await l.accept(later("approval"), at(1))).status, 503);
+  // Make the queued write look like one the unsigned recorder left behind.
+  const p = st.m.get("pending") as { stored: string; storedSha: string };
+  const old = JSON.parse(p.stored);
+  delete old.sig;
+  old.v = 1;
+  p.stored = JSON.stringify(old);
+  p.storedSha = await sha256(p.stored);
+  assert.equal((await l.accept(later("verdict"), at(2))).status, 201); // within the window: not "late"
+  assert.equal(await sealedOk(l, b, keyFor(2, G, "approval")), true);
+});

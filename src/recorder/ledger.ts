@@ -186,6 +186,11 @@ export class Ledger {
           p = { ...p, stored, storedSha: await sha256(stored), receipt, day: charged };
           writes.pending = p;
           await this.storage.put(writes);
+        } else if ((JSON.parse(p.stored) as Envelope).v !== 2) {
+          // Queued before this recorder signed records (card 6a04908f): signed now, before it is stored.
+          const stored = await this.#seal(JSON.parse(p.stored) as Envelope);
+          p = { ...p, stored, storedSha: await sha256(stored) };
+          await this.storage.put({ pending: p });
         }
         await this.bucket.put(p.key, p.stored, { customMetadata: { sha256: p.storedSha }, httpMetadata: { contentType: "application/json" } });
       }

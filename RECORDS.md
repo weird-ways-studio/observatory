@@ -77,7 +77,9 @@ or logged. Records stored before signing began are version 1, with no `sig`.
 The checker trusts one public key, written into `PIN` in `src/records.ts` by a PR Ben merges:
 `{ key: "<public_key from GET /v1/status>", from: <the first record number that must be signed> }`.
 Until then the checker reads as it did before signing, except that a shared number is only a
-finding. A lost or replaced key makes every later record foreign, loudly, until Ben merges the
+finding. When a pin first takes effect, every number from `from` that was already read is checked
+once for exactly one signed copy (an `unsigned` finding otherwise), without being counted again; the
+run stays unverified until that check has caught up. A lost or replaced key makes every later record foreign, loudly, until Ben merges the
 new key.
 
 ## What the Observatory checks every hour
@@ -86,7 +88,8 @@ Every record stored since its last run, asking for the next expected number by n
 so names elsewhere in the bucket cost nothing and cannot hide records still to come (at most 500
 an hour; more is itself a finding). From `PIN.from` on, the record at a number is the one copy whose
 signature the pinned key verifies and whose envelope names that same number, grant and stage; every
-other object there is a foreign finding, and reading goes on with no step for Ben. With no signed
+other object there is a foreign finding, and reading goes on with no step for Ben (the recorder
+itself still stops, 503, while something else sits under its next number). With no signed
 copy at a number yet, the bookmark waits there and reads it again next hour. Two signed copies at
 one number mean the key may be stolen: a `forged` finding, ranked first, and the read stops there,
 unverified. More than 20 objects at one number, or one that cannot be read, also leaves the run

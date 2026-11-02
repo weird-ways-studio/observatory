@@ -38,7 +38,9 @@ export const MAX_QUEUED = 200; // findings not yet delivered, carried hour to ho
 /** One finding: `id` is stable across hours so Ben hears about it once. Text never holds writer-chosen words. */
 export interface Finding { id: string; text: string }
 interface Open { job: string; req: string; at: number; stages: Stage[] }
-interface State { seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
+// `sealed`: numbers from the pin's start up to `to` were confirmed signed under the pin with this key.
+// `held`/`snap` come only from the checker before signing; they are read once, never saved again.
+interface State { sealed?: { key: string; to: number }; held?: unknown[]; snap?: { seq: number; open: Record<string, Open>; days: Record<string, number> }; seq?: number; open?: Record<string, Open>; days?: Record<string, number>; alerted?: string[]; swept?: Finding[]; queued?: Finding[] }
 
 const day = (d: Date) => d.toISOString().slice(0, 10);
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -53,7 +55,7 @@ const pad = (n: number) => String(n).padStart(12, "0");
  */
 export const fp = async (grant: string) => `#${(await sha256(grant)).slice(0, 16)}`;
 // Worst first: what ran unrecorded or unchecked before what is merely malformed.
-const RANK = ["forged", "unrecorded", "unapproved", "approval-first", "mismatch", "duplicate", "duplicate-number", "foreign", "gap", "lock", "cap", "backlog", "verdict-first", "bad", "stray", "sweep"];
+const RANK = ["forged", "unsigned", "unrecorded", "unapproved", "approval-first", "mismatch", "duplicate", "duplicate-number", "foreign", "gap", "lock", "cap", "backlog", "verdict-first", "bad", "stray", "sweep"];
 const rank = (f: Finding) => { const i = RANK.indexOf(f.id.split(":")[0]); return i < 0 ? RANK.length : i; };
 const isFinding = (f: unknown): f is Finding => typeof (f as Finding)?.id === "string" && typeof (f as Finding)?.text === "string";
 
@@ -87,6 +89,20 @@ export async function signedBy(key: CryptoKey, n: number, name: string, text: st
     return false;
   }
 }
+
+/** The copies at one number sorted by the pinned key: signed for that number, foreign, or unreadable. */
+async function sealsAt(bucket: Pick<R2Bucket, "get">, key: CryptoKey, n: number, cands: R2Object[]) {
+  const seals: { o: R2Object; body: string }[] = [], foreign: Finding[] = [];
+  let unreadable = false;
+  for (const c of cands) {
+    const text = c.size > MAX_STORED_BYTES ? null : await bucket.get(c.key).then((b) => (b ? b.text() : undefined), () => undefined);
+    if (text === undefined) unreadable = true;
+    else if (text !== null && (await signedBy(key, n, c.key, text))) seals.push({ o: c, body: text });
+    else { const t = await tag(c.key); foreign.push({ id: `foreign:${n}:${t}`, text: `record ${n}: an object the recorder did not sign, fingerprint ${t}: something wrote around the recorder` }); }
+  }
+  return { seals, foreign, unreadable };
+}
+const forged = (n: number, count: number): Finding => ({ id: `forged:${n}`, text: `${count} objects at record number ${n} carry the recorder's signature: its key may be stolen` });
 
 /** The order check for one record, against the grants seen so far. Updates `open`. */
 export function checkOrder(open: Record<string, Open>, grant: string, stage: Stage, job: string, request: string | undefined, sha: string, at: number, n: number, shown: string): Finding | undefined {
@@ -160,9 +176,16 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   } catch { /* an unreadable state re-reads from the start and re-alerts at worst: safer than silence */ }
   // No prototype: a grant id can never reach a built-in object property.
   const bare = <T>(o: unknown): Record<string, T> => Object.assign(Object.create(null), o && typeof o === "object" ? o : {});
-  const open = bare<Open>(prev.open);
-  const days = bare<number>(prev.days);
+  let open = bare<Open>(prev.open);
+  let days = bare<number>(prev.days);
   let seq = Number.isInteger(prev.seq) ? prev.seq! : 0; // the last record number checked: the bookmark
+  if (Array.isArray(prev.held) && prev.held.length) {
+    // The checker before signing passed these numbers without counting them: read again from just
+    // before the first, with the bookkeeping it saved there, so none is skipped (Codex r1 #1).
+    const n = prev.held.filter((x): x is number => Number.isInteger(x));
+    if (prev.snap && Number.isInteger(prev.snap.seq)) ({ seq } = prev.snap), (open = bare<Open>(prev.snap.open)), (days = bare<number>(prev.snap.days));
+    else if (n.length) seq = Math.min(seq, Math.min(...n) - 1);
+  }
   let swept = Array.isArray(prev.swept) ? prev.swept.filter(isFinding).slice(0, MAX_SWEPT) : [];
   // A record is read once, so a finding not yet delivered is carried until it is.
   const findings: Finding[] = Array.isArray(prev.queued) ? prev.queued.filter(isFinding).slice(0, MAX_QUEUED) : [];
@@ -178,6 +201,27 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   } catch {
     verdict = "unverified";
     reason = "the pinned recorder key could not be read";
+  }
+  // Numbers from the pin's start that were read before this pin took effect: each is checked once
+  // for exactly one signed copy, without counting it again (Codex r1 #2).
+  let sealedTo = key && prev.sealed?.key === pin!.key && Number.isInteger(prev.sealed.to) ? prev.sealed.to : from - 1;
+  try {
+    if (key && env.RECORDS && verdict === "healthy") {
+      while (sealedTo < seq && checked < PAGE) {
+        const n = sealedTo + 1, here = await namesAt(env.RECORDS, `${ROOT}${pad(n)}.`);
+        if (here.capped || here.cands.length > MAX_COPIES) throw new Error("too many");
+        const s = await sealsAt(env.RECORDS, key, n, here.cands);
+        if (s.unreadable) throw new Error("unreadable");
+        if (s.seals.length > 1) findings.push(forged(n, s.seals.length));
+        else if (!s.seals.length) findings.push({ id: `unsigned:${n}`, text: `record ${n} was read before the key was pinned and has no copy the recorder signed` });
+        sealedTo = n;
+        checked++;
+      }
+      if (sealedTo < seq) throw new Error("not done");
+    }
+  } catch {
+    verdict = "unverified";
+    reason = `records read before the key was pinned are still being checked for signatures (up to ${sealedTo})`;
   }
   if (!env.RECORDS) {
     verdict = "unverified";
@@ -214,16 +258,10 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
         if (next >= from) {
           // The record is the one copy the recorder signed; anything else here was written around
           // it. No signed copy yet: the bookmark waits at this number and reads it again next hour.
-          const seals: { o: R2Object; body: string }[] = [];
-          let unreadable = false;
-          for (const c of cands) {
-            const text = c.size > MAX_STORED_BYTES ? null : await env.RECORDS.get(c.key).then((b) => (b ? b.text() : undefined), () => undefined);
-            if (text === undefined) unreadable = true;
-            else if (text !== null && (await signedBy(key!, next, c.key, text))) seals.push({ o: c, body: text });
-            else { const t = await tag(c.key); findings.push({ id: `foreign:${next}:${t}`, text: `record ${next}: an object the recorder did not sign, fingerprint ${t}: something wrote around the recorder` }); }
-          }
+          const { seals, foreign, unreadable } = await sealsAt(env.RECORDS, key!, next, cands);
+          findings.push(...foreign);
           if (seals.length > 1) {
-            findings.push({ id: `forged:${next}`, text: `${seals.length} objects at record number ${next} carry the recorder's signature: its key may be stolen` });
+            findings.push(forged(next, seals.length));
             verdict = "unverified";
             reason = `record ${next} has ${seals.length} signed copies: reading stopped there`;
             break;
@@ -284,6 +322,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   }
   for (const [d, n] of Object.entries(days)) if (n > DAY_CAP) findings.push({ id: `cap:${d}`, text: `${n} records stored on ${d}, over the cap of ${DAY_CAP}` });
   findings.push(...swept);
+  if (key) sealedTo = Math.max(sealedTo, seq);
   // Forget grants past their life, keeping at most MAX_OPEN, and day counts older than three days.
   for (const [g, o] of Object.entries(open)) if (now.getTime() - o.at > GRANT_TTL_MS + 86_400_000) delete open[g];
   for (const g of Object.keys(open).sort((a, b) => open[a].at - open[b].at).slice(0, Math.max(0, Object.keys(open).length - MAX_OPEN))) delete open[g];
@@ -328,7 +367,7 @@ export async function runRecords(env: RecordsEnv, fetchFn: (req: Request) => Pro
   // Keep only what is still found, so a finding that comes back is told again.
   const still = new Set([...findings.map((f) => f.id), ...(verdict === "unverified" ? ["unverified"] : [])]);
   try {
-    await env.COPY.put(STATE_KEY, JSON.stringify({ seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
+    await env.COPY.put(STATE_KEY, JSON.stringify({ sealed: key ? { key: pin!.key, to: sealedTo } : undefined, seq, open, days, alerted: [...told].filter((id) => still.has(id)), swept, queued } satisfies State));
   } catch {
     reason = `records state could not be saved; ${reason}`;
     verdict = "unverified";

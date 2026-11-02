@@ -346,13 +346,34 @@ test("T9: a pin that cannot be read is unverified, never a crash, and reads noth
   }
 });
 
-test("T13: state saved by the old checker (held numbers, snapshot, replay) is dropped; reading goes on from the bookmark", async () => {
+test("T13 (Codex r1 #1): a number the old checker held and passed is read again from its saved bookkeeping, never skipped", async () => {
   const b = bucket(), e = env(b), l = await viaRecorder(b, [G], -10, ["request", "approval"]);
-  await e.COPY.put(STATE_KEY, JSON.stringify({ seq: 1, held: [2], snap: { seq: 1, open: {}, days: {} }, replayTo: 9, open: {}, days: {} }));
+  await planted(b, 2, "grant-plant-a", "request", at(-5));
+  // What the old checker saved: bookmark past the held number 2, snapshot taken just before it.
+  await e.COPY.put(STATE_KEY, JSON.stringify({ seq: 2, held: [2], snap: { seq: 1, open: { [G]: { job: "cf.token.canary", req: "x", at: at(-10).getTime(), stages: ["request"] } }, days: { "2026-11-01": 1 } }, open: {}, days: {} }));
   const r = await runRecords(e, wire().fetch, NOW, await pinOf(l));
-  assert.equal(r.seq, 2);
+  // Number 1 gets its one signature check (new pin), then number 2 is read in its place and counted.
+  assert.deepEqual([r.seq, r.checked], [2, 2]);
   const saved = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
   assert.deepEqual(["held", "snap", "replayTo"].filter((k) => k in saved), []);
+  assert.equal(saved.days["2026-11-01"], 2);
+});
+
+test("Codex r1 #2: when the pin arrives after records were read unsigned, each is checked once for a signature and not counted again", async () => {
+  const b = bucket(), e = env(b), real = new Ledger(memory(), b);
+  b.setClock(at(-10)); await real.accept(rec("request"), () => at(-10)); // number 1, signed
+  await planted(b, 2, "grant-plant-u", "request", at(-9)); // number 2, unsigned, read before any pin
+  assert.equal((await runRecords(e, wire().fetch, NOW, undefined)).seq, 2);
+  const r = await runRecords(e, wire().fetch, at(60), await pinOf(real));
+  assert.equal(r.seq, 2);
+  assert.match(r.reason, /record 2 was read before the key was pinned and has no copy the recorder signed/);
+  assert.ok(!/record 1 was read/.test(r.reason));
+  const saved = JSON.parse(e.COPY.store.get(STATE_KEY)!.body);
+  assert.equal(saved.sealed.to, 2);
+  assert.equal(Object.values(saved.days as Record<string, number>).reduce((x, y) => x + y, 0), 2); // not counted twice
+  // Once checked, later hours do not check them again.
+  const again = await runRecords(e, wire().fetch, at(120), await pinOf(real));
+  assert.equal(again.checked, 0);
 });
 
 test("security review: junk names under a number cannot hide its real record", async () => {
